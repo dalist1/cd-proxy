@@ -1,0 +1,16 @@
+[Unit]
+Description=cd-proxy minimal Codex OAuth proxy
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/cd-proxy
+Environment=CD_PROXY_HOST=127.0.0.1
+Environment=CD_PROXY_PORT=8318
+Environment=CD_PROXY_AUTH_DIR=%h/.local/share/cd-proxy/auths
+ExecStart=%h/.local/bin/bun run start
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

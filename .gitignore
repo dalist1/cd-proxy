@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# local env/secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# generated/build outputs
+.zig-cache/
+zig-out/
+dist/
+build/
+
+# logs/temp
+*.log
+.DS_Store

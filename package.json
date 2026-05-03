@@ -1,0 +1,17 @@
+{
+  "name": "cd-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Codex-only ChatGPT OAuth proxy with round-robin credential rotation.",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "CD_PROXY_DEBUG=1 bun --watch src/server.ts",
+    "check": "bun run src/server.ts --check",
+    "zig:build": "zig build -p zig-out",
+    "zig:check": "zig build run --"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
