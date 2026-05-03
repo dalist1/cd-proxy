@@ -42,6 +42,13 @@ interface AuthEntry {
   refreshInFlight?: Promise<void>;
 }
 
+interface WsProxyData {
+  upstream: WebSocket;
+  upstreamOpen: boolean;
+  queue: Array<string | ArrayBuffer | Uint8Array>;
+  authLabel: string;
+}
+
 let auths: AuthEntry[] = [];
 let rr = 0;
 let apiKey: string | undefined;
@@ -294,6 +301,85 @@ function buildHeaders(req: Request, a: AuthEntry): Headers {
   return h;
 }
 
+function buildWebSocketHeaders(req: Request, a: AuthEntry): Headers {
+  const h = new Headers(req.headers);
+  for (const name of [
+    "host",
+    "connection",
+    "upgrade",
+    "content-length",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+  ]) h.delete(name);
+  h.set("authorization", `Bearer ${a.data.access_token}`);
+  if (a.data.account_id) h.set("ChatGPT-Account-ID", a.data.account_id);
+  return h;
+}
+
+function websocketUrlForPath(path: string): string {
+  const url = new URL(`${CHATGPT_CODEX_BASE}/${path}`);
+  if (url.protocol === "https:") url.protocol = "wss:";
+  else if (url.protocol === "http:") url.protocol = "ws:";
+  return url.toString();
+}
+
+function isWebSocketUpgrade(req: Request): boolean {
+  return req.headers.get("upgrade")?.toLowerCase() === "websocket";
+}
+
+async function proxyWebSocketUpgrade(req: Request, server: any, path: string): Promise<Response> {
+  if (unauthorized(req)) return jsonResponse({ error: { message: "unauthorized" } }, { status: 401 });
+  if (auths.length === 0) return jsonResponse({ error: { message: `no codex auth files found in ${AUTH_DIR}` } }, { status: 503 });
+
+  const tried = new Set<AuthEntry>();
+  const a = chooseAuth(tried);
+  if (!a) return jsonResponse({ error: { message: "all codex credentials failed or are cooling down" } }, { status: 503 });
+  tried.add(a);
+  await ensureFresh(a);
+
+  const upstreamUrl = websocketUrlForPath(path);
+  const upstreamHeaders = Object.fromEntries(buildWebSocketHeaders(req, a).entries());
+  const upstream = new WebSocket(upstreamUrl, { headers: upstreamHeaders });
+  const queue: WsProxyData["queue"] = [];
+  const data: WsProxyData = { upstream, upstreamOpen: false, queue, authLabel: a.label };
+
+  upstream.addEventListener("open", () => {
+    data.upstreamOpen = true;
+    log(`WS ${new URL(req.url).pathname} -> ${upstreamUrl} as ${a.label}`);
+    for (const msg of data.queue.splice(0)) upstream.send(msg as any);
+  });
+  upstream.addEventListener("message", async (event: MessageEvent) => {
+    const client = (upstream as any).__client;
+    if (!client) return;
+    const payload = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+    client.send(payload as any);
+  });
+  upstream.addEventListener("close", (event: CloseEvent) => {
+    const client = (upstream as any).__client;
+    try { client?.close(event.code || 1000, event.reason || undefined); } catch {}
+  });
+  upstream.addEventListener("error", () => {
+    const client = (upstream as any).__client;
+    try { client?.close(1011, "upstream websocket error"); } catch {}
+  });
+
+  const ok = server.upgrade(req, {
+    data,
+    headers: EXPOSE_ROTATION_HEADERS ? {
+      "x-cd-proxy-auth-label": a.label,
+      ...(a.data.account_id ? { "x-cd-proxy-auth-account-prefix": a.data.account_id.slice(0, 5) } : {}),
+      "x-cd-proxy-next-rr-index": String(rr % Math.max(1, auths.length)),
+    } : undefined,
+  });
+  if (!ok) {
+    upstream.close();
+    return jsonResponse({ error: { message: "websocket upgrade failed" } }, { status: 400 });
+  }
+  return undefined as any;
+}
+
 async function proxyWithRotation(req: Request, path: string): Promise<Response> {
   const tried = new Set<AuthEntry>();
   let lastStatus = 0;
@@ -357,8 +443,13 @@ async function proxyWithRotation(req: Request, path: string): Promise<Response> 
   return jsonResponse({ error: { message: "all codex credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
 }
 
-async function handle(req: Request): Promise<Response> {
+async function handle(req: Request, server?: any): Promise<Response> {
   const url = new URL(req.url);
+  if (isWebSocketUpgrade(req)) {
+    const path = upstreamPath(url);
+    if (!path || path !== "responses") return jsonResponse({ error: { message: "websocket endpoint not found" } }, { status: 404 });
+    return proxyWebSocketUpgrade(req, server, path);
+  }
   if (url.pathname === "/health" || url.pathname === "/v1/health") {
     return jsonResponse({ ok: true, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, zig_core: !!zigCore });
   }
@@ -405,5 +496,21 @@ await loadApiKey();
 await loadAuths();
 setInterval(loadAuths, 60_000).unref();
 
-Bun.serve({ host: HOST, port: PORT, fetch: handle });
+Bun.serve({
+  host: HOST,
+  port: PORT,
+  fetch: handle,
+  websocket: {
+    open(ws: ServerWebSocket<WsProxyData>) {
+      (ws.data.upstream as any).__client = ws;
+    },
+    message(ws: ServerWebSocket<WsProxyData>, message: string | Buffer) {
+      if (ws.data.upstreamOpen) ws.data.upstream.send(message as any);
+      else ws.data.queue.push(message as any);
+    },
+    close(ws: ServerWebSocket<WsProxyData>) {
+      try { ws.data.upstream.close(); } catch {}
+    },
+  },
+});
 console.error(`cd-proxy listening on http://${HOST}:${PORT} using ${auths.length} codex auth(s); upstream=${CHATGPT_CODEX_BASE}`);

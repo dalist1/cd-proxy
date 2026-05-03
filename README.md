@@ -59,15 +59,17 @@ Supported proxy paths:
 - `GET /v1/models` returns a static OpenAI-compatible model list
 - `POST /v1/responses` proxies to `https://chatgpt.com/backend-api/codex/responses`
 - `POST /v1/responses/compact` proxies to `https://chatgpt.com/backend-api/codex/responses/compact`
+- `WS /v1/responses` proxies to `wss://chatgpt.com/backend-api/codex/responses` for OpenAI/Codex Responses WebSockets
 - same paths without `/v1` are also accepted
 
 Round-robin behavior:
 
 1. Loads `codex-*.json` auth files from the cd-proxy auth dir.
-2. Picks the next enabled credential for every request.
+2. Picks the next enabled credential for every HTTP request and WebSocket connection.
 3. Refreshes a credential before use if its expiry is near.
-4. On `401`, refreshes and retries once.
-5. On `429`, cools that credential briefly and rotates to the next credential.
+4. On HTTP `401`, refreshes and retries once.
+5. On HTTP `429`, cools that credential briefly and rotates to the next credential.
+6. For WebSockets, cd-proxy forwards the upgrade to the Codex Responses endpoint and freely pipes frames both ways; Codex headers such as `OpenAI-Beta: responses_websockets=2026-02-06`, `x-client-request-id`, `session_id`, and turn-state metadata are preserved.
 
 Useful env vars:
 
@@ -177,5 +179,13 @@ Run the granular rotation suite. This uses a temporary auth dir with fake Codex 
 
 ```bash
 ./scripts/granular-round-robin-test.ts
+```
+
+Test OpenAI/Codex Responses WebSocket flow-through against a local mock upstream:
+
+```bash
+./scripts/test-websocket-flow.ts
+# or run core tests together
+bun run test
 ```
 
