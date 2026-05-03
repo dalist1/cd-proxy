@@ -10,7 +10,9 @@
     "check": "zig build -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts --check",
     "zig:build": "zig build -p zig-out",
     "zig:check": "zig build run --",
-    "test": "zig build test && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts",
+    "assert:native": "bash scripts/assert-native-implementation.sh",
+    "test": "bun run assert:native && zig build test && bun run scripts/test-native-auth.ts && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts && bun run scripts/test-pi-coding-agent.ts",
+    "test:pi-real-ws": "bun run scripts/test-pi-real-websocket.ts",
     "test:direct-ws": "bun run scripts/test-direct-websocket.ts"
   },
   "devDependencies": {

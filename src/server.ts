@@ -2,13 +2,15 @@ import { existsSync } from "node:fs";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dlopen, FFIType, suffix } from "bun:ffi";
+import { refreshCodexTokens } from "./codex-auth";
 
-const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"; // OpenAI Codex CLI ChatGPT OAuth client id
-const TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? "https://auth.openai.com/oauth/token";
-const CHATGPT_CODEX_BASE = (process.env.CD_PROXY_UPSTREAM_BASE ?? "https://chatgpt.com/backend-api/codex").replace(/\/+$/, "");
+const DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_CODEX_BASE = (process.env.CD_PROXY_UPSTREAM_BASE ?? DEFAULT_CHATGPT_CODEX_BASE).replace(/\/+$/, "");
+const CLIPROXY_DEFAULT_PORT = "8317"; // NATIVE_ASSERT_ALLOW: refused wrapper port only.
+assertNativeUpstreamBase(CHATGPT_CODEX_BASE);
 const HOME = process.env.HOME ?? ".";
 const AUTH_DIR = expandHome(process.env.CD_PROXY_AUTH_DIR ?? "~/.local/share/cd-proxy/auths");
-const API_KEY_FILE = expandHome(process.env.CD_PROXY_API_KEY_FILE ?? "~/.config/cliproxyapi/api-key");
+const API_KEY_FILE = expandHome(process.env.CD_PROXY_API_KEY_FILE ?? "~/.config/cd-proxy/api-key");
 const PORT = Number(process.env.CD_PROXY_PORT ?? "8318");
 const HOST = process.env.CD_PROXY_HOST ?? "127.0.0.1";
 const DEBUG = process.env.CD_PROXY_DEBUG === "1" || process.env.CD_PROXY_DEBUG === "true";
@@ -52,6 +54,11 @@ interface WsProxyData {
 let auths: AuthEntry[] = [];
 let rr = 0;
 let apiKey: string | undefined;
+const transportStats = {
+  responsesHttpRequests: 0,
+  responsesWebSocketUpgrades: 0,
+  responsesWebSocketUpstreamOpens: 0,
+};
 let zigCore: undefined | {
   cdproxy_pick_next_u32(len: number, start: number, unavailableMask: number): number;
   cdproxy_mask_bit_u32(idx: number): number;
@@ -59,6 +66,17 @@ let zigCore: undefined | {
 
 function expandHome(p: string): string {
   return p === "~" ? HOME : p.startsWith("~/") ? HOME + p.slice(1) : p;
+}
+
+function assertNativeUpstreamBase(base: string) {
+  const parsed = new URL(base);
+  const localHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+  if (localHosts.has(parsed.hostname) && parsed.port === CLIPROXY_DEFAULT_PORT) {
+    throw new Error(
+      `Refusing CD_PROXY_UPSTREAM_BASE=${base}. cd-proxy is a native Codex/ChatGPT OAuth implementation and must not wrap the globally installed cliproxy service. ` +
+      `Unset CD_PROXY_UPSTREAM_BASE to use ${DEFAULT_CHATGPT_CODEX_BASE}, or point it at a non-cliproxy mock only for tests.`,
+    );
+  }
 }
 
 function log(...args: unknown[]) {
@@ -120,28 +138,6 @@ async function loadAuths() {
     }
   }
 
-  // Optional: include the active Codex CLI auth.json too. Off by default so we mirror cliproxy's auth-dir.
-  if (process.env.CD_PROXY_INCLUDE_CODEX_HOME === "1") {
-    const path = expandHome("~/.codex/auth.json");
-    try {
-      const raw = JSON.parse(await readFile(path, "utf8"));
-      if (raw.tokens?.access_token && raw.tokens?.refresh_token) {
-        const data: CodexAuthFile = {
-          type: "codex",
-          email: "~/.codex/auth.json",
-          access_token: raw.tokens.access_token,
-          refresh_token: raw.tokens.refresh_token,
-          id_token: raw.tokens.id_token,
-          account_id: raw.tokens.account_id,
-          last_refresh: raw.last_refresh,
-          disabled: false,
-        };
-        const old = auths.find((a) => a.path === path);
-        next.push({ path, label: data.email!, data, coolingUntil: old?.coolingUntil ?? 0, refreshInFlight: old?.refreshInFlight });
-      }
-    } catch {}
-  }
-
   auths = next;
   if (rr >= auths.length) rr = 0;
   log(`loaded ${auths.length} codex auth(s) from ${AUTH_DIR}`);
@@ -180,30 +176,19 @@ function decodeJwtClaims(jwt?: string): any | undefined {
 }
 
 async function persistAuth(a: AuthEntry) {
-  await writeFile(a.path, JSON.stringify(a.data), { mode: 0o600 });
+  await writeFile(a.path, JSON.stringify(a.data) + "\n", { mode: 0o600 });
 }
 
 async function refreshAuth(a: AuthEntry): Promise<void> {
   if (a.refreshInFlight) return a.refreshInFlight;
   a.refreshInFlight = (async () => {
     log(`refreshing ${a.label} (${redact(a.data.refresh_token)})`);
-    const res = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client_id: CODEX_CLIENT_ID, grant_type: "refresh_token", refresh_token: a.data.refresh_token }),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`token refresh failed for ${a.label}: ${res.status} ${text.slice(0, 500)}`);
-    }
-    const json = await res.json() as { id_token?: string; access_token?: string; refresh_token?: string; expires_in?: number };
-    if (json.access_token) a.data.access_token = json.access_token;
-    if (json.refresh_token) a.data.refresh_token = json.refresh_token;
-    if (json.id_token) a.data.id_token = json.id_token;
-    const exp = json.id_token ? jwtExpMs(json.id_token) : undefined;
-    if (exp) a.data.expired = new Date(exp).toISOString();
-    else if (json.expires_in) a.data.expired = new Date(Date.now() + json.expires_in * 1000).toISOString();
-    a.data.last_refresh = new Date().toISOString();
+    const refreshed = await refreshCodexTokens(a.data.refresh_token);
+    a.data.access_token = refreshed.access_token;
+    a.data.refresh_token = refreshed.refresh_token;
+    if (refreshed.id_token) a.data.id_token = refreshed.id_token;
+    if (refreshed.expired) a.data.expired = refreshed.expired;
+    a.data.last_refresh = refreshed.last_refresh;
     const claims = decodeJwtClaims(a.data.id_token);
     a.data.email ??= claims?.email ?? claims?.["https://api.openai.com/profile"]?.email;
     a.data.account_id ??= claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
@@ -283,8 +268,8 @@ function withRotationHeaders(res: Response, a: AuthEntry, attempt: number): Resp
 function upstreamPath(url: URL): string | undefined {
   if (url.pathname === "/health" || url.pathname === "/v1/health") return undefined;
   if (url.pathname === "/v1/models" || url.pathname === "/models") return "models";
-  if (url.pathname === "/v1/responses" || url.pathname === "/responses") return "responses";
-  if (url.pathname === "/v1/responses/compact" || url.pathname === "/responses/compact") return "responses/compact";
+  if (url.pathname === "/v1/responses" || url.pathname === "/responses" || url.pathname === "/codex/responses" || url.pathname === "/backend-api/codex/responses") return "responses";
+  if (url.pathname === "/v1/responses/compact" || url.pathname === "/responses/compact" || url.pathname === "/codex/responses/compact" || url.pathname === "/backend-api/codex/responses/compact") return "responses/compact";
   return undefined;
 }
 
@@ -346,6 +331,7 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string): P
   const data: WsProxyData = { upstream, upstreamOpen: false, queue, authLabel: a.label };
 
   upstream.addEventListener("open", () => {
+    transportStats.responsesWebSocketUpstreamOpens++;
     data.upstreamOpen = true;
     log(`WS ${new URL(req.url).pathname} -> ${upstreamUrl} as ${a.label}`);
     for (const msg of data.queue.splice(0)) upstream.send(msg as any);
@@ -377,10 +363,12 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string): P
     upstream.close();
     return jsonResponse({ error: { message: "websocket upgrade failed" } }, { status: 400 });
   }
+  transportStats.responsesWebSocketUpgrades++;
   return undefined as any;
 }
 
 async function proxyWithRotation(req: Request, path: string): Promise<Response> {
+  if (path === "responses" || path === "responses/compact") transportStats.responsesHttpRequests++;
   const tried = new Set<AuthEntry>();
   let lastStatus = 0;
   let lastText = "";
@@ -451,7 +439,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
     return proxyWebSocketUpgrade(req, server, path);
   }
   if (url.pathname === "/health" || url.pathname === "/v1/health") {
-    return jsonResponse({ ok: true, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, zig_core: !!zigCore });
+    return jsonResponse({ ok: true, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore });
   }
   if (url.pathname === "/reload" && req.method === "POST") {
     if (unauthorized(req)) return jsonResponse({ error: "unauthorized" }, { status: 401 });
@@ -460,7 +448,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
   }
   if (unauthorized(req)) return jsonResponse({ error: { message: "unauthorized" } }, { status: 401 });
   if (url.pathname === "/status" || url.pathname === "/v1/status") {
-    return jsonResponse({ ok: true, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
+    return jsonResponse({ ok: true, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
   }
   if (url.pathname === "/debug/rotation" || url.pathname === "/v1/debug/rotation") {
     const count = Math.min(100, Math.max(1, Number(url.searchParams.get("count") ?? String(auths.length || 1))));
@@ -488,7 +476,7 @@ loadZigCore();
 if (process.argv.includes("--check")) {
   await loadApiKey();
   await loadAuths();
-  console.log(JSON.stringify({ ok: auths.length > 0, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey }, null, 2));
+  console.log(JSON.stringify({ ok: auths.length > 0, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey, api_key_file: API_KEY_FILE }, null, 2));
   process.exit(auths.length > 0 ? 0 : 1);
 }
 

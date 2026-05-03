@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BASE="${CD_PROXY_BASE_URL:-http://127.0.0.1:8318}"
-API_KEY="${CD_PROXY_API_KEY:-$(cat "${CD_PROXY_API_KEY_FILE:-$HOME/.config/cliproxyapi/api-key}")}"
+API_KEY="${CD_PROXY_API_KEY:-$(cat "${CD_PROXY_API_KEY_FILE:-$HOME/.config/cd-proxy/api-key}")}"
 COUNT="${1:-14}"
 json="$(curl -fsS -H "Authorization: Bearer $API_KEY" "$BASE/debug/rotation?count=$COUNT")"
 bun -e '

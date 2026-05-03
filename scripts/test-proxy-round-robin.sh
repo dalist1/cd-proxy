@@ -3,7 +3,7 @@ set -euo pipefail
 MOCK_PORT="${CD_PROXY_TEST_MOCK_PORT:-18444}"
 PROXY_PORT="${CD_PROXY_TEST_PROXY_PORT:-8320}"
 AUTH_DIR="${CD_PROXY_AUTH_DIR:-$HOME/.local/share/cd-proxy/auths}"
-API_KEY="${CD_PROXY_API_KEY:-$(cat "${CD_PROXY_API_KEY_FILE:-$HOME/.config/cliproxyapi/api-key}")}"
+API_KEY="${CD_PROXY_API_KEY:-$(cat "${CD_PROXY_API_KEY_FILE:-$HOME/.config/cd-proxy/api-key}")}"
 mock="$(mktemp --suffix=.ts)"
 cat >"$mock" <<TS
 Bun.serve({host:'127.0.0.1', port:$MOCK_PORT, fetch(req) {

@@ -1,26 +1,36 @@
 # cd-proxy
 
-Minimal Codex-only proxy in **Bun**, plus a small **Zig** auth checker. It mirrors the relevant `cliproxy` setup installed on this machine:
+Native Codex-only proxy in **Bun**, plus a small **Zig** rotation/auth checker. This is **not** a wrapper around the globally installed `cliproxy`/CLIProxyAPI service:
 
-- `cliproxy` wrapper: `~/.local/bin/cliproxy`
-- service: `cliproxyapi.service`
-- health target: `http://127.0.0.1:8317/v1/models`
-- API key: `~/.config/cliproxyapi/api-key`
-- Source Codex auth dir: `~/.local/share/cliproxyapi/auths`
-- Mirrored cd-proxy auth dir: `~/.local/share/cd-proxy/auths`
-- routing strategy in current cliproxy config: `round-robin`
+- runtime starts `bun run src/server.ts`, not `cliproxy`
+- default upstream is the real Codex backend: `https://chatgpt.com/backend-api/codex`
+- the server refuses `CD_PROXY_UPSTREAM_BASE` values that point at the known local `cliproxy` default port
+- browser OAuth, device-code OAuth, token refresh, credential storage, request handling, routing, retries, and WebSockets are implemented here
 
 This project only implements Codex/ChatGPT OAuth token auth, not the full CLIProxyAPI provider matrix.
 
-## What matches Codex login
+## Native auth compatibility
 
-From the current OpenAI Codex CLI sources, ChatGPT/Codex auth uses:
+cd-proxy implements the same Codex OAuth mechanics used by CLIProxyAPI/cliproxy for Codex credentials, without invoking `codex login`, `cliproxy`, or `CLIProxyAPI`:
+
+- authorization endpoint: `https://auth.openai.com/oauth/authorize`
+- authorization params: PKCE `S256`, `scope = openid email profile offline_access`, `prompt = login`, `id_token_add_organizations = true`, `codex_cli_simplified_flow = true`
+- callback URI: `http://localhost:1455/auth/callback`
+- token exchange endpoint: `https://auth.openai.com/oauth/token` with `application/x-www-form-urlencoded`
+- refresh grant includes `scope = openid profile email`
+- device flow uses `https://auth.openai.com/api/accounts/deviceauth/usercode`, `https://auth.openai.com/api/accounts/deviceauth/token`, then exchanges at the token endpoint with redirect `https://auth.openai.com/deviceauth/callback`
+- credential files are native `codex-*.json` files compatible with cliproxy's Codex auth format and filename convention
+
+## What matches Codex upstream
+
+From the current OpenAI Codex CLI sources, ChatGPT/Codex API access uses:
 
 - token refresh endpoint: `https://auth.openai.com/oauth/token`
-- OAuth refresh grant body:
+- OAuth refresh grant form body:
   - `client_id = app_EMoamEEZ73f0CkXaXp7hrann`
   - `grant_type = refresh_token`
   - `refresh_token = ...`
+  - `scope = openid profile email`
 - upstream Codex backend base: `https://chatgpt.com/backend-api/codex`
 - request auth headers:
   - `Authorization: Bearer <access_token>`
@@ -36,21 +46,29 @@ bun run start
 
 Defaults:
 
-- listen: `127.0.0.1:8318` (keeps global `cliproxy` on `8317` untouched)
-- auth dir: `~/.local/share/cd-proxy/auths` after mirroring from cliproxy
-- API key file: `~/.config/cliproxyapi/api-key` (same bearer key cliproxy uses)
+- listen: `127.0.0.1:8318`
+- auth dir: `~/.local/share/cd-proxy/auths`
+- API key file: `~/.config/cd-proxy/api-key` (or set `CD_PROXY_API_KEY`; unauthenticated local use is allowed when no key is configured)
+
+Create a local bearer key if you want client authorization enabled:
+
+```bash
+mkdir -p ~/.config/cd-proxy
+openssl rand -hex 32 > ~/.config/cd-proxy/api-key
+chmod 600 ~/.config/cd-proxy/api-key
+```
 
 Health check:
 
 ```bash
-curl -H "Authorization: Bearer $(cat ~/.config/cliproxyapi/api-key)" \
+curl -H "Authorization: Bearer $(cat ~/.config/cd-proxy/api-key)" \
   http://127.0.0.1:8318/health
 ```
 
 Models check:
 
 ```bash
-curl -H "Authorization: Bearer $(cat ~/.config/cliproxyapi/api-key)" \
+curl -H "Authorization: Bearer $(cat ~/.config/cd-proxy/api-key)" \
   http://127.0.0.1:8318/v1/models
 ```
 
@@ -61,6 +79,7 @@ Supported proxy paths:
 - `POST /v1/responses/compact` proxies to `https://chatgpt.com/backend-api/codex/responses/compact`
 - `WS /v1/responses` proxies to `wss://chatgpt.com/backend-api/codex/responses` for OpenAI/Codex Responses WebSockets
 - same paths without `/v1` are also accepted
+- Pi/OpenAI-Codex-compatible `/codex/responses` and `/codex/responses/compact` are accepted too
 
 Round-robin behavior:
 
@@ -77,7 +96,7 @@ Useful env vars:
 CD_PROXY_HOST=127.0.0.1
 CD_PROXY_PORT=8318
 CD_PROXY_AUTH_DIR=~/.local/share/cd-proxy/auths
-CD_PROXY_API_KEY_FILE=~/.config/cliproxyapi/api-key
+CD_PROXY_API_KEY_FILE=~/.config/cd-proxy/api-key
 CD_PROXY_API_KEY=override-local-bearer-key
 CD_PROXY_MAX_RETRY_CREDENTIALS=5
 CD_PROXY_COOLDOWN_MS=30000
@@ -98,13 +117,45 @@ The Zig side now has two pieces:
 zig build test
 zig build -p zig-out
 ./zig-out/bin/cd-proxy-zig
-bun run check   # shows zig_core: true when the shared library loaded
+bun run check   # shows native_implementation: true, wraps_cliproxy: false, and zig_core status
+bun run assert:native
 ```
 
 Optional override:
 
 ```bash
 CD_PROXY_ZIG_CORE=/absolute/path/to/libcd_proxy_core.so bun run start
+```
+
+## Pi coding agent pointing at cd-proxy
+
+This repo includes `.pi/settings.json` with:
+
+```json
+{ "transport": "websocket" }
+```
+
+That forces Pi's OpenAI/Codex transport to WebSocket and disables Pi's `auto` transport SSE fallback path for this project.
+
+For Pi, configure an OpenAI-compatible Codex provider in `~/.pi/agent/models.json` using `api: "openai-codex-responses"` and `baseUrl: "http://127.0.0.1:8318"`. cd-proxy accepts Pi's `/codex/responses` WebSocket path and rotates its own native Codex credentials upstream.
+
+The mock integration test starts a mock Codex WebSocket upstream, starts cd-proxy, runs the real `pi` CLI against provider `openai`, and asserts:
+
+- Pi receives `pi-cd-proxy-ok`
+- the upstream saw a WebSocket connection
+- the upstream saw zero HTTP POSTs, proving no SSE fallback was used
+- Pi's `OpenAI-Beta: responses_websockets=...` header and `response.create` frame passed through cd-proxy
+
+```bash
+bun run scripts/test-pi-coding-agent.ts
+```
+
+The real-credential smoke test uses `~/.local/share/cd-proxy/auths`, talks to `https://chatgpt.com/backend-api/codex` through cd-proxy, and asserts cd-proxy recorded WebSocket upgrades/upstream opens and zero HTTP Responses POSTs:
+
+```bash
+bun run test:pi-real-ws
+# optional model override
+CD_PROXY_REAL_WS_MODEL=gpt-5.3-codex bun run test:pi-real-ws
 ```
 
 ## Codex CLI pointing at cd-proxy
@@ -125,32 +176,22 @@ env_key = "CD_PROXY_API_KEY"
 Then run:
 
 ```bash
-export CD_PROXY_API_KEY="$(cat ~/.config/cliproxyapi/api-key)"
+export CD_PROXY_API_KEY="$(cat ~/.config/cd-proxy/api-key)"
 bun run start
 ```
 
-Keep global `cliproxy` running or stopped independently; this project defaults to a different port.
+Keep global `cliproxy` running or stopped independently; cd-proxy does not call it.
 
-## Credential mirroring and new logins
+## Native Codex login
 
-Mirror existing cliproxy Codex credentials into cd-proxy's own auth dir:
-
-```bash
-./scripts/mirror-credentials.sh
-```
-
-Import the active `~/.codex/auth.json` ChatGPT login:
-
-```bash
-bun run scripts/import-codex-auth.ts
-```
-
-Authenticate a new Codex OAuth account without overwriting your normal `~/.codex` login:
+Authenticate a new Codex OAuth account natively, without using `~/.codex/auth.json`, `codex login`, `cliproxy`, or CLIProxyAPI:
 
 ```bash
 ./scripts/codex-login-to-cd-proxy.sh
-# or use device-code auth
+# or use native device-code auth
 ./scripts/codex-login-to-cd-proxy.sh --device-auth
+# or skip automatic browser launch
+./scripts/codex-login-to-cd-proxy.sh --no-browser
 ```
 
 `--with-api-key` is intentionally rejected for cd-proxy upstream auth: the Codex ChatGPT backend uses Codex/ChatGPT OAuth tokens. The local proxy API key is still supported for clients via `CD_PROXY_API_KEY` / `CD_PROXY_API_KEY_FILE`.
@@ -160,7 +201,7 @@ Test selector rotation without hitting upstream:
 ```bash
 ./scripts/test-rotation.sh 14
 # or
-curl -H "Authorization: Bearer $(cat ~/.config/cliproxyapi/api-key)" \
+curl -H "Authorization: Bearer $(cat ~/.config/cd-proxy/api-key)" \
   'http://127.0.0.1:8318/debug/rotation?count=10'
 ```
 
@@ -170,7 +211,7 @@ Test actual proxied request rotation against a local mock upstream:
 ./scripts/test-proxy-round-robin.sh
 ```
 
-Run the granular rotation suite. This uses a temporary auth dir with fake Codex credentials, turns on debug rotation headers, and proves:
+Run the native auth parity checks plus the granular rotation suite. The auth check verifies CLIProxyAPI-compatible OAuth params, form-encoded token exchange/refresh, filename convention, and saved JSON shape. The rotation suite uses a temporary auth dir with fake Codex credentials, turns on debug rotation headers, and proves:
 
 - exact A → B → C → A → B → C per-request routing
 - disabled credentials are skipped after `/reload`
@@ -185,6 +226,7 @@ Test OpenAI/Codex Responses WebSocket flow-through against a local mock upstream
 
 ```bash
 ./scripts/test-websocket-flow.ts
+bun run scripts/test-pi-coding-agent.ts
 # or run core tests together
 bun run test
 ```
