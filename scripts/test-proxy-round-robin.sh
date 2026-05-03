@@ -15,14 +15,22 @@ CD_PROXY_PORT="$PROXY_PORT" CD_PROXY_AUTH_DIR="$AUTH_DIR" CD_PROXY_UPSTREAM_BASE
 cleanup(){ kill "$proxy_pid" "$mock_pid" 2>/dev/null || true; rm -f "$mock"; }
 trap cleanup EXIT
 sleep 1
-python3 - "$API_KEY" "$PROXY_PORT" <<'PY'
-import json, subprocess, sys
-key, port = sys.argv[1:3]
-accounts=[]
-for _ in range(14):
-    out=subprocess.check_output(['curl','-fsS','-H',f'Authorization: Bearer {key}','-H','content-type: application/json','-d','{}',f'http://127.0.0.1:{port}/v1/responses'])
-    accounts.append(json.loads(out)['account'])
-for i,a in enumerate(accounts): print(i, (a[:5]+'…'+a[-4:]) if a else None)
-assert accounts[:7] == accounts[7:14], 'first seven routed accounts did not repeat'
-print('actual proxy round-robin ok: first 7 routed accounts repeat')
-PY
+bun -e '
+const key = process.argv[1];
+const port = process.argv[2];
+const accounts = [];
+for (let i = 0; i < 14; i++) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) throw new Error(`request ${i} failed: ${res.status} ${await res.text()}`);
+  accounts.push((await res.json()).account);
+}
+for (const [i, a] of accounts.entries()) console.log(i, a ? `${a.slice(0, 5)}…${a.slice(-4)}` : null);
+if (JSON.stringify(accounts.slice(0, 7)) !== JSON.stringify(accounts.slice(7, 14))) {
+  throw new Error("first seven routed accounts did not repeat");
+}
+console.log("actual proxy round-robin ok: first 7 routed accounts repeat");
+' "$API_KEY" "$PROXY_PORT"
