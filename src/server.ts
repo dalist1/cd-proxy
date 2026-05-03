@@ -6,7 +6,7 @@ import { refreshCodexTokens } from "./codex-auth";
 
 const DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex";
 const CHATGPT_CODEX_BASE = (process.env.CD_PROXY_UPSTREAM_BASE ?? DEFAULT_CHATGPT_CODEX_BASE).replace(/\/+$/, "");
-const CLIPROXY_DEFAULT_PORT = "8317"; // NATIVE_ASSERT_ALLOW: refused wrapper port only.
+const LEGACY_LOCAL_PROXY_PORT = "8317"; // NATIVE_ASSERT_ALLOW: refused legacy local proxy port only.
 assertNativeUpstreamBase(CHATGPT_CODEX_BASE);
 const HOME = process.env.HOME ?? ".";
 const AUTH_DIR = expandHome(process.env.CD_PROXY_AUTH_DIR ?? "~/.local/share/cd-proxy/auths");
@@ -18,7 +18,7 @@ const EXPOSE_ROTATION_HEADERS = process.env.CD_PROXY_EXPOSE_ROTATION_HEADERS ===
 const MAX_RETRY_CREDENTIALS = Number(process.env.CD_PROXY_MAX_RETRY_CREDENTIALS ?? "5");
 const COOLDOWN_MS = Number(process.env.CD_PROXY_COOLDOWN_MS ?? "30000");
 const REFRESH_SKEW_MS = Number(process.env.CD_PROXY_REFRESH_SKEW_MS ?? String(5 * 60_000));
-const MODEL_IDS = (process.env.CD_PROXY_MODELS ?? "gpt-5.3-codex,gpt-5.3-codex-spark,codex-auto-review,gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.2")
+const MODEL_IDS = (process.env.CD_PROXY_MODELS ?? "gpt-5.3-codex,gpt-5.3-codex-spark,codex-auto-review,gpt-5.5,gpt-5.2")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -71,10 +71,10 @@ function expandHome(p: string): string {
 function assertNativeUpstreamBase(base: string) {
   const parsed = new URL(base);
   const localHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-  if (localHosts.has(parsed.hostname) && parsed.port === CLIPROXY_DEFAULT_PORT) {
+  if (localHosts.has(parsed.hostname) && parsed.port === LEGACY_LOCAL_PROXY_PORT) {
     throw new Error(
-      `Refusing CD_PROXY_UPSTREAM_BASE=${base}. cd-proxy is a native Codex/ChatGPT OAuth implementation and must not wrap the globally installed cliproxy service. ` +
-      `Unset CD_PROXY_UPSTREAM_BASE to use ${DEFAULT_CHATGPT_CODEX_BASE}, or point it at a non-cliproxy mock only for tests.`,
+      `Refusing CD_PROXY_UPSTREAM_BASE=${base}. cd-proxy is a native Codex/ChatGPT OAuth implementation and must not wrap another local proxy. ` +
+      `Unset CD_PROXY_UPSTREAM_BASE to use ${DEFAULT_CHATGPT_CODEX_BASE}, or point it at a non-production mock only for tests.`,
     );
   }
 }
@@ -439,7 +439,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
     return proxyWebSocketUpgrade(req, server, path);
   }
   if (url.pathname === "/health" || url.pathname === "/v1/health") {
-    return jsonResponse({ ok: true, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore });
+    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore });
   }
   if (url.pathname === "/reload" && req.method === "POST") {
     if (unauthorized(req)) return jsonResponse({ error: "unauthorized" }, { status: 401 });
@@ -448,7 +448,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
   }
   if (unauthorized(req)) return jsonResponse({ error: { message: "unauthorized" } }, { status: 401 });
   if (url.pathname === "/status" || url.pathname === "/v1/status") {
-    return jsonResponse({ ok: true, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
+    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
   }
   if (url.pathname === "/debug/rotation" || url.pathname === "/v1/debug/rotation") {
     const count = Math.min(100, Math.max(1, Number(url.searchParams.get("count") ?? String(auths.length || 1))));
@@ -476,7 +476,7 @@ loadZigCore();
 if (process.argv.includes("--check")) {
   await loadApiKey();
   await loadAuths();
-  console.log(JSON.stringify({ ok: auths.length > 0, native_implementation: true, wraps_cliproxy: false, upstream_base: CHATGPT_CODEX_BASE, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey, api_key_file: API_KEY_FILE }, null, 2));
+  console.log(JSON.stringify({ ok: auths.length > 0, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey, api_key_file: API_KEY_FILE }, null, 2));
   process.exit(auths.length > 0 ? 0 : 1);
 }
 

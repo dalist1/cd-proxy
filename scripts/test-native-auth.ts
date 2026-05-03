@@ -23,7 +23,7 @@ function jwt(claims: any) {
 }
 
 const pkce = generatePKCECodes();
-assert(pkce.codeVerifier.length === 128, "PKCE verifier must match CLIProxyAPI 96-byte base64url generation");
+assert(pkce.codeVerifier.length === 128, "PKCE verifier must use 96 random bytes encoded as base64url");
 assert(/^[A-Za-z0-9_-]+$/.test(pkce.codeVerifier), "PKCE verifier must be URL-safe");
 assert(/^[A-Za-z0-9_-]+$/.test(pkce.codeChallenge), "PKCE challenge must be URL-safe");
 
@@ -80,7 +80,7 @@ try {
   try {
     const dest = await saveCodexAuthRecord(record, dir);
     const saved = await readFile(dest, "utf8");
-    assert(saved.endsWith("\n"), "saved auth must match CLIProxyAPI json.Encoder newline");
+    assert(saved.endsWith("\n"), "saved auth must end with a newline");
     assert(JSON.parse(saved).type === "codex", "saved auth parse mismatch");
   } finally {
     await rm(dir, { recursive: true, force: true });

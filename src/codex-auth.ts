@@ -45,7 +45,7 @@ export interface CodexAuthRecord {
 }
 
 export function generatePKCECodes(): PKCECodes {
-  // CLIProxyAPI generates 96 random bytes, encoded as unpadded URL-safe base64.
+  // Generate 96 random bytes, encoded as unpadded URL-safe base64.
   const codeVerifier = base64Url(randomBytes(96));
   const codeChallenge = base64Url(createHash("sha256").update(codeVerifier).digest());
   return { codeVerifier, codeChallenge };
@@ -139,7 +139,7 @@ export async function pollCodexDeviceToken(deviceAuthId: string, userCode: strin
 export async function saveCodexAuthRecord(record: CodexAuthRecord, authDir: string): Promise<string> {
   await mkdir(authDir, { recursive: true, mode: 0o700 });
   const dest = join(authDir, record.fileName);
-  // CLIProxyAPI uses json.Encoder, which writes one JSON object plus a trailing newline.
+  // Write one JSON object plus a trailing newline.
   await writeFile(dest, JSON.stringify(record.auth) + "\n", { mode: 0o600 });
   await chmod(dest, 0o600).catch(() => {});
   return dest;

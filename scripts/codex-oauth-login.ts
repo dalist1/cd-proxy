@@ -25,8 +25,8 @@ let redirectUri = CODEX_REDIRECT_URI;
 function usage(): never {
   console.error(`usage: bun run scripts/codex-oauth-login.ts [--device-auth] [--no-browser] [--timeout-seconds N] [--auth-dir DIR]
 
-Native Codex OAuth login compatible with CLIProxyAPI/cliproxy credential files.
-This does not invoke codex, cliproxy, or CLIProxyAPI.
+Native Codex OAuth login for cd-proxy credential files.
+This does not invoke external login tools.
 
 Options:
   --device-auth          Use Codex device-code flow

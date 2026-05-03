@@ -1,17 +1,16 @@
 # cd-proxy
 
-Native Codex-only proxy in **Bun**, plus a small **Zig** rotation/auth checker. This is **not** a wrapper around the globally installed `cliproxy`/CLIProxyAPI service:
+Native Codex-only proxy in **Bun**, plus a small **Zig** rotation/auth checker.
 
-- runtime starts `bun run src/server.ts`, not `cliproxy`
+- runtime starts `bun run src/server.ts`
 - default upstream is the real Codex backend: `https://chatgpt.com/backend-api/codex`
-- the server refuses `CD_PROXY_UPSTREAM_BASE` values that point at the known local `cliproxy` default port
 - browser OAuth, device-code OAuth, token refresh, credential storage, request handling, routing, retries, and WebSockets are implemented here
 
-This project only implements Codex/ChatGPT OAuth token auth, not the full CLIProxyAPI provider matrix.
+This project only implements Codex/ChatGPT OAuth token auth.
 
-## Native auth compatibility
+## Native auth
 
-cd-proxy implements the same Codex OAuth mechanics used by CLIProxyAPI/cliproxy for Codex credentials, without invoking `codex login`, `cliproxy`, or `CLIProxyAPI`:
+cd-proxy implements Codex OAuth credential handling directly:
 
 - authorization endpoint: `https://auth.openai.com/oauth/authorize`
 - authorization params: PKCE `S256`, `scope = openid email profile offline_access`, `prompt = login`, `id_token_add_organizations = true`, `codex_cli_simplified_flow = true`
@@ -19,11 +18,11 @@ cd-proxy implements the same Codex OAuth mechanics used by CLIProxyAPI/cliproxy 
 - token exchange endpoint: `https://auth.openai.com/oauth/token` with `application/x-www-form-urlencoded`
 - refresh grant includes `scope = openid profile email`
 - device flow uses `https://auth.openai.com/api/accounts/deviceauth/usercode`, `https://auth.openai.com/api/accounts/deviceauth/token`, then exchanges at the token endpoint with redirect `https://auth.openai.com/deviceauth/callback`
-- credential files are native `codex-*.json` files compatible with cliproxy's Codex auth format and filename convention
+- credential files are native `codex-*.json` files stored under the cd-proxy auth dir
 
 ## What matches Codex upstream
 
-From the current OpenAI Codex CLI sources, ChatGPT/Codex API access uses:
+ChatGPT/Codex API access uses:
 
 - token refresh endpoint: `https://auth.openai.com/oauth/token`
 - OAuth refresh grant form body:
@@ -117,7 +116,7 @@ The Zig side now has two pieces:
 zig build test
 zig build -p zig-out
 ./zig-out/bin/cd-proxy-zig
-bun run check   # shows native_implementation: true, wraps_cliproxy: false, and zig_core status
+bun run check   # shows native_implementation: true and zig_core status
 bun run assert:native
 ```
 
@@ -158,33 +157,9 @@ bun run test:pi-real-ws
 CD_PROXY_REAL_WS_MODEL=gpt-5.3-codex bun run test:pi-real-ws
 ```
 
-## Codex CLI pointing at cd-proxy
-
-For Codex CLI/OpenAI-compatible configs, use this as a local Responses provider:
-
-```toml
-model_provider = "cd-proxy"
-model = "gpt-5.3-codex"
-
-[model_providers.cd-proxy]
-name = "cd-proxy"
-base_url = "http://127.0.0.1:8318/v1"
-wire_api = "responses"
-env_key = "CD_PROXY_API_KEY"
-```
-
-Then run:
-
-```bash
-export CD_PROXY_API_KEY="$(cat ~/.config/cd-proxy/api-key)"
-bun run start
-```
-
-Keep global `cliproxy` running or stopped independently; cd-proxy does not call it.
-
 ## Native Codex login
 
-Authenticate a new Codex OAuth account natively, without using `~/.codex/auth.json`, `codex login`, `cliproxy`, or CLIProxyAPI:
+Authenticate a new Codex OAuth account natively:
 
 ```bash
 ./scripts/codex-login-to-cd-proxy.sh
@@ -211,7 +186,7 @@ Test actual proxied request rotation against a local mock upstream:
 ./scripts/test-proxy-round-robin.sh
 ```
 
-Run the native auth parity checks plus the granular rotation suite. The auth check verifies CLIProxyAPI-compatible OAuth params, form-encoded token exchange/refresh, filename convention, and saved JSON shape. The rotation suite uses a temporary auth dir with fake Codex credentials, turns on debug rotation headers, and proves:
+Run the native auth checks plus the granular rotation suite. The auth check verifies OAuth params, form-encoded token exchange/refresh, filename convention, and saved JSON shape. The rotation suite uses a temporary auth dir with fake Codex credentials, turns on debug rotation headers, and proves:
 
 - exact A → B → C → A → B → C per-request routing
 - disabled credentials are skipped after `/reload`
@@ -237,4 +212,3 @@ Test direct WebSocket connectivity to OpenAI/Codex without cd-proxy in the path.
 bun run test:direct-ws       # first usable account
 ./scripts/test-direct-websocket.ts --all
 ```
-
