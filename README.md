@@ -189,3 +189,10 @@ Test OpenAI/Codex Responses WebSocket flow-through against a local mock upstream
 bun run test
 ```
 
+Test direct WebSocket connectivity to OpenAI/Codex without cd-proxy in the path. This performs only the WebSocket handshake and immediately closes; it does not send a model request:
+
+```bash
+bun run test:direct-ws       # first usable account
+./scripts/test-direct-websocket.ts --all
+```
+
