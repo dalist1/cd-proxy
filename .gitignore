@@ -7,6 +7,14 @@ node_modules/
 !.env.example
 *.pem
 *.key
+api-key
+auth.json
+.credentials.json
+codex-*.json
+auths/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # generated/build outputs
 .zig-cache/
