@@ -58,6 +58,7 @@ const transportStats = {
   responsesHttpRequests: 0,
   responsesWebSocketUpgrades: 0,
   responsesWebSocketUpstreamOpens: 0,
+  responsesWebSocketTerminalEvents: 0,
 };
 let zigCore: undefined | {
   cdproxy_pick_next_u32(len: number, start: number, unavailableMask: number): number;
@@ -314,6 +315,20 @@ function isWebSocketUpgrade(req: Request): boolean {
   return req.headers.get("upgrade")?.toLowerCase() === "websocket";
 }
 
+function isTerminalResponseEventPayload(payload: unknown): boolean {
+  let text: string | undefined;
+  if (typeof payload === "string") text = payload;
+  else if (payload instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(payload));
+  else if (ArrayBuffer.isView(payload)) text = new TextDecoder().decode(payload as Uint8Array);
+  if (!text) return false;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed?.type === "response.completed" || parsed?.type === "response.done" || parsed?.type === "response.incomplete";
+  } catch {
+    return false;
+  }
+}
+
 async function proxyWebSocketUpgrade(req: Request, server: any, path: string): Promise<Response> {
   if (unauthorized(req)) return jsonResponse({ error: { message: "unauthorized" } }, { status: 401 });
   if (auths.length === 0) return jsonResponse({ error: { message: `no codex auth files found in ${AUTH_DIR}` } }, { status: 503 });
@@ -341,6 +356,7 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string): P
     if (!client) return;
     const payload = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
     client.send(payload as any);
+    if (isTerminalResponseEventPayload(payload)) transportStats.responsesWebSocketTerminalEvents++;
   });
   upstream.addEventListener("close", (event: CloseEvent) => {
     const client = (upstream as any).__client;

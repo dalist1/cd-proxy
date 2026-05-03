@@ -26,6 +26,32 @@ async function drain(stream: ReadableStream<Uint8Array> | null) {
   if (!stream) return "";
   try { return await new Response(stream).text(); } catch { return ""; }
 }
+async function collect(stream: ReadableStream<Uint8Array> | null, onChunk?: (text: string) => void) {
+  if (!stream) return "";
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      out += text;
+      onChunk?.(text);
+    }
+    const tail = decoder.decode();
+    out += tail;
+    if (tail) onChunk?.(tail);
+  } catch {}
+  return out;
+}
+function sleep(ms: number) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function timeoutAfter<T>(ms: number, value: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(value), ms);
+    timer.unref?.();
+  });
+}
 async function waitFor(url: string, headers?: Record<string, string>) {
   const deadline = Date.now() + 20_000;
   let last = "";
@@ -39,6 +65,26 @@ async function waitFor(url: string, headers?: Record<string, string>) {
     await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error(`timeout waiting for ${url}: ${last}`);
+}
+async function waitForTerminalWebSocketStats(port: number, apiKey: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/status`, { headers: { authorization: `Bearer ${apiKey}` } });
+      const text = await res.text();
+      if (res.ok) {
+        const status = JSON.parse(text);
+        const stats = status.transport_stats ?? {};
+        if ((stats.responsesWebSocketTerminalEvents ?? 0) >= 1) return status;
+        last = JSON.stringify(stats);
+      } else {
+        last = `${res.status} ${text}`;
+      }
+    } catch (err) { last = String(err); }
+    await sleep(150);
+  }
+  throw new Error(`timeout waiting for terminal WebSocket response event: ${last}`);
 }
 
 const authFiles = (await readdir(AUTH_DIR).catch(() => []))
@@ -122,24 +168,50 @@ try {
       OPENAI_API_KEY: "",
     },
   });
+  let stdout = "";
+  let stderr = "";
+  const stdoutDone = collect(pi.stdout, (text) => { stdout += text; });
+  const stderrDone = collect(pi.stderr, (text) => { stderr += text; });
+  const exitPromise = pi.exited.catch(() => -1);
+  const timeoutMs = Number(process.env.CD_PROXY_REAL_WS_TIMEOUT_MS ?? "20000");
   let timedOut = false;
-  const killTimer = setTimeout(() => {
-    timedOut = true;
+  const statusResult = await Promise.race([
+    waitForTerminalWebSocketStats(proxyPort, API_KEY, timeoutMs).then((status) => ({ kind: "terminal" as const, status })),
+    exitPromise.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+    timeoutAfter(timeoutMs, { kind: "timeout" as const }),
+  ]);
+  if (statusResult.kind !== "terminal") {
+    timedOut = statusResult.kind === "timeout";
     pi.kill("SIGTERM");
     setTimeout(() => pi.kill("SIGKILL"), 1000).unref();
-  }, Number(process.env.CD_PROXY_REAL_WS_TIMEOUT_MS ?? "120000"));
-  const [exitCode, stdout, stderr] = await Promise.all([pi.exited, drain(pi.stdout), drain(pi.stderr)]);
-  clearTimeout(killTimer);
-  if (exitCode !== 0 && !(timedOut && stdout.includes(EXPECTED))) {
-    throw new Error(`pi exited ${exitCode}${timedOut ? " after timeout" : ""}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    const exitCode = statusResult.kind === "exit" ? statusResult.exitCode : await exitPromise;
+    await Promise.allSettled([stdoutDone, stderrDone]);
+    throw new Error(`pi ${timedOut ? "timed out" : `exited ${exitCode}`} before cd-proxy saw a terminal WebSocket event\nstdout:\n${stdout}\nstderr:\n${stderr}`);
   }
 
-  const status = JSON.parse(await waitFor(`http://127.0.0.1:${proxyPort}/status`, { authorization: `Bearer ${API_KEY}` }));
+  const status = statusResult.status;
   const stats = status.transport_stats ?? {};
   assert(stats.responsesWebSocketUpgrades >= 1, `cd-proxy did not record a WebSocket upgrade: ${JSON.stringify(stats)}`);
   assert(stats.responsesWebSocketUpstreamOpens >= 1, `cd-proxy did not open upstream WebSocket: ${JSON.stringify(stats)}`);
   assert(stats.responsesHttpRequests === 0, `SSE fallback/HTTP Responses path was used: ${JSON.stringify(stats)}`);
-  assert(stdout.includes(EXPECTED), `Pi output did not include expected marker. stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`);
+
+  let piCleanupKilled = false;
+  const exitedAfterMarker = await Promise.race([exitPromise.then(() => true), sleep(1000).then(() => false)]);
+  if (!exitedAfterMarker) {
+    // Pi currently leaves a cached Codex WebSocket idle timer alive in one-shot
+    // mode after response.completed. We have already proven the real WebSocket
+    // path worked, so clean up instead of making the smoke test wait for that
+    // unrelated idle timer.
+    piCleanupKilled = true;
+    pi.kill("SIGTERM");
+    setTimeout(() => pi.kill("SIGKILL"), 1000).unref();
+  }
+  const exitCode = await exitPromise;
+  await Promise.allSettled([stdoutDone, stderrDone]);
+  if (exitCode !== 0 && !piCleanupKilled && !timedOut) {
+    throw new Error(`pi exited ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  }
+  assert(stdout.includes(EXPECTED), `Pi output did not include expected marker after cleanup. stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`);
 
   console.log(JSON.stringify({
     ok: true,
@@ -150,6 +222,7 @@ try {
     output: stdout.trim(),
     transport_stats: stats,
     sse_fallback_used: false,
+    pi_cleanup_killed: piCleanupKilled,
   }, null, 2));
 } finally {
   proxy.kill();

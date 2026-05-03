@@ -149,7 +149,7 @@ The mock integration test starts a mock Codex WebSocket upstream, starts cd-prox
 bun run scripts/test-pi-coding-agent.ts
 ```
 
-The real-credential smoke test uses `~/.local/share/cd-proxy/auths`, talks to `https://chatgpt.com/backend-api/codex` through cd-proxy, and asserts cd-proxy recorded WebSocket upgrades/upstream opens and zero HTTP Responses POSTs:
+The real-credential smoke test uses `~/.local/share/cd-proxy/auths`, talks to `https://chatgpt.com/backend-api/codex` through cd-proxy, and asserts cd-proxy recorded WebSocket upgrades/upstream opens, a terminal WebSocket response event, and zero HTTP Responses POSTs. Pi currently keeps an internal one-shot Codex WebSocket idle timer alive after completion, so the smoke test cleans up the Pi subprocess after cd-proxy has proven the real WebSocket path completed:
 
 ```bash
 bun run test:pi-real-ws
