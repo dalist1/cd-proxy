@@ -1,5 +1,7 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { dlopen, FFIType, suffix } from "bun:ffi";
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"; // OpenAI Codex CLI ChatGPT OAuth client id
 const TOKEN_URL = process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE ?? "https://auth.openai.com/oauth/token";
@@ -18,6 +20,7 @@ const MODEL_IDS = (process.env.CD_PROXY_MODELS ?? "gpt-5.3-codex,gpt-5.3-codex-s
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const ZIG_CORE_PATH = expandHome(process.env.CD_PROXY_ZIG_CORE ?? join(process.cwd(), "zig-out", "lib", `libcd_proxy_core.${suffix}`));
 
 interface CodexAuthFile {
   type?: string;
@@ -42,6 +45,10 @@ interface AuthEntry {
 let auths: AuthEntry[] = [];
 let rr = 0;
 let apiKey: string | undefined;
+let zigCore: undefined | {
+  cdproxy_pick_next_u32(len: number, start: number, unavailableMask: number): number;
+  cdproxy_mask_bit_u32(idx: number): number;
+};
 
 function expandHome(p: string): string {
   return p === "~" ? HOME : p.startsWith("~/") ? HOME + p.slice(1) : p;
@@ -54,6 +61,20 @@ function log(...args: unknown[]) {
 function redact(s?: string) {
   if (!s) return s;
   return s.length <= 10 ? "REDACTED" : `${s.slice(0, 5)}…${s.slice(-4)}`;
+}
+
+function loadZigCore() {
+  if (zigCore || !existsSync(ZIG_CORE_PATH)) return;
+  try {
+    const lib = dlopen(ZIG_CORE_PATH, {
+      cdproxy_pick_next_u32: { args: [FFIType.u32, FFIType.u32, FFIType.u32], returns: FFIType.i32 },
+      cdproxy_mask_bit_u32: { args: [FFIType.u32], returns: FFIType.u32 },
+    });
+    zigCore = lib.symbols as unknown as typeof zigCore;
+    log(`loaded Zig rotation core: ${ZIG_CORE_PATH}`);
+  } catch (err) {
+    console.error(`warning: failed to load Zig rotation core at ${ZIG_CORE_PATH}; using JS fallback: ${err}`);
+  }
 }
 
 async function loadApiKey() {
@@ -187,6 +208,26 @@ async function refreshAuth(a: AuthEntry): Promise<void> {
 function chooseAuth(exclude = new Set<AuthEntry>()): AuthEntry | undefined {
   const now = Date.now();
   if (auths.length === 0) return undefined;
+
+  // Hot-path rotation: let Zig do the wrap/skip scan for the common <=32 credential case.
+  // JS still owns credential objects/timers; Zig only receives a compact unavailable bitmask.
+  if (zigCore && auths.length <= 32) {
+    let unavailableMask = 0;
+    for (let i = 0; i < auths.length; i++) {
+      const a = auths[i];
+      if (exclude.has(a) || a.data.disabled || a.coolingUntil > now) {
+        unavailableMask = (unavailableMask | zigCore.cdproxy_mask_bit_u32(i)) >>> 0;
+      }
+    }
+    const idx = zigCore.cdproxy_pick_next_u32(auths.length, rr % auths.length, unavailableMask);
+    if (idx >= 0) {
+      rr = idx + 1;
+      return auths[idx];
+    }
+    rr += auths.length;
+    return undefined;
+  }
+
   for (let i = 0; i < auths.length; i++) {
     const idx = rr++ % auths.length;
     const a = auths[idx];
@@ -319,7 +360,7 @@ async function proxyWithRotation(req: Request, path: string): Promise<Response> 
 async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname === "/health" || url.pathname === "/v1/health") {
-    return jsonResponse({ ok: true, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR });
+    return jsonResponse({ ok: true, auths: auths.filter((a) => !a.data.disabled).length, auth_dir: AUTH_DIR, zig_core: !!zigCore });
   }
   if (url.pathname === "/reload" && req.method === "POST") {
     if (unauthorized(req)) return jsonResponse({ error: "unauthorized" }, { status: 401 });
@@ -328,7 +369,7 @@ async function handle(req: Request): Promise<Response> {
   }
   if (unauthorized(req)) return jsonResponse({ error: { message: "unauthorized" } }, { status: 401 });
   if (url.pathname === "/status" || url.pathname === "/v1/status") {
-    return jsonResponse({ ok: true, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, auths: auths.map(publicAuthInfo) });
+    return jsonResponse({ ok: true, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
   }
   if (url.pathname === "/debug/rotation" || url.pathname === "/v1/debug/rotation") {
     const count = Math.min(100, Math.max(1, Number(url.searchParams.get("count") ?? String(auths.length || 1))));
@@ -351,10 +392,12 @@ async function handle(req: Request): Promise<Response> {
   return proxyWithRotation(req, path);
 }
 
+loadZigCore();
+
 if (process.argv.includes("--check")) {
   await loadApiKey();
   await loadAuths();
-  console.log(JSON.stringify({ ok: auths.length > 0, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey }, null, 2));
+  console.log(JSON.stringify({ ok: auths.length > 0, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map((a) => ({ label: a.label, disabled: !!a.data.disabled, account_id: a.data.account_id ? redact(a.data.account_id) : undefined })), api_key: !!apiKey }, null, 2));
   process.exit(auths.length > 0 ? 0 : 1);
 }
 

@@ -5,9 +5,9 @@
   "type": "module",
   "description": "Minimal Codex-only ChatGPT OAuth proxy with round-robin credential rotation.",
   "scripts": {
-    "start": "bun run src/server.ts",
+    "start": "zig build -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts",
     "dev": "CD_PROXY_DEBUG=1 bun --watch src/server.ts",
-    "check": "bun run src/server.ts --check",
+    "check": "zig build -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts --check",
     "zig:build": "zig build -p zig-out",
     "zig:check": "zig build run --"
   },

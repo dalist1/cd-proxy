@@ -83,15 +83,26 @@ CD_PROXY_DEBUG=1
 CD_PROXY_MODELS=gpt-5.3-codex,codex-auto-review
 ```
 
-## Zig checker
+## Zig acceleration
 
-The Zig side is intentionally tiny right now: it verifies that Zig can see the mirrored Codex auth material and prints redacted account prefixes.
+The Zig side now has two pieces:
+
+- `zig-src/core.zig` builds `zig-out/lib/libcd_proxy_core.so`, a tiny native round-robin/skip-scan core used by Bun through `bun:ffi` when present.
+- `zig-src/main.zig` builds `zig-out/bin/cd-proxy-zig`, a fast auth-dir checker that prints redacted account prefixes.
+
+`bun run start` and `bun run check` try to build the Zig artifacts first, then gracefully fall back to the TypeScript implementation if Zig is unavailable.
 
 ```bash
-zig build run
-# or
+zig build test
 zig build -p zig-out
 ./zig-out/bin/cd-proxy-zig
+bun run check   # shows zig_core: true when the shared library loaded
+```
+
+Optional override:
+
+```bash
+CD_PROXY_ZIG_CORE=/absolute/path/to/libcd_proxy_core.so bun run start
 ```
 
 ## Codex CLI pointing at cd-proxy
