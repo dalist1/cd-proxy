@@ -7,6 +7,7 @@ const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const HOME = process.env.HOME ?? ".";
 const AUTH_DIR = expandHome(process.env.CD_PROXY_AUTH_DIR ?? "~/.local/share/cd-proxy/auths");
 const MODEL = process.env.CD_PROXY_REAL_WS_MODEL ?? "gpt-5.3-codex";
+const PROXY_IMPL = process.env.CD_PROXY_REAL_WS_IMPL ?? "bun";
 const EXPECTED = `cd-proxy-real-ws-ok-${Date.now().toString(36)}`;
 const API_KEY = fakeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "pi-local-proxy-auth" } });
 
@@ -97,7 +98,12 @@ if (authFiles.length === 0) {
 const temp = await mkdtemp(join(tmpdir(), "cd-proxy-real-pi-ws-"));
 const piDir = join(temp, "pi");
 const proxyPort = await freePort();
-const proxy = Bun.spawn(["bun", "run", "src/server.ts"], {
+if (PROXY_IMPL === "zig") {
+  const build = Bun.spawnSync(["zig", "build", "-Doptimize=Debug", "-p", "zig-out"], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
+  if (!build.success) throw new Error(`zig build failed\nstdout:\n${build.stdout?.toString()}\nstderr:\n${build.stderr?.toString()}`);
+}
+const proxyCommand = PROXY_IMPL === "zig" ? ["./zig-out/bin/cd-proxy-zig", "--serve"] : ["bun", "run", "src/server.ts"];
+const proxy = Bun.spawn(proxyCommand, {
   cwd: ROOT,
   stdout: "pipe",
   stderr: "pipe",
@@ -110,8 +116,10 @@ const proxy = Bun.spawn(["bun", "run", "src/server.ts"], {
     CD_PROXY_DEBUG: "1",
   },
 });
-const proxyStdout = drain(proxy.stdout);
-const proxyStderr = drain(proxy.stderr);
+let proxyStdoutText = "";
+let proxyStderrText = "";
+const proxyStdout = collect(proxy.stdout, (text) => { proxyStdoutText += text; });
+const proxyStderr = collect(proxy.stderr, (text) => { proxyStderrText += text; });
 
 try {
   await Bun.write(join(piDir, ".keep"), "");
@@ -186,7 +194,7 @@ try {
     setTimeout(() => pi.kill("SIGKILL"), 1000).unref();
     const exitCode = statusResult.kind === "exit" ? statusResult.exitCode : await exitPromise;
     await Promise.allSettled([stdoutDone, stderrDone]);
-    throw new Error(`pi ${timedOut ? "timed out" : `exited ${exitCode}`} before cd-proxy saw a terminal WebSocket event\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    throw new Error(`pi ${timedOut ? "timed out" : `exited ${exitCode}`} before cd-proxy saw a terminal WebSocket event\nstdout:\n${stdout}\nstderr:\n${stderr}\nproxy stdout:\n${proxyStdoutText}\nproxy stderr:\n${proxyStderrText}`);
   }
 
   const status = statusResult.status;
@@ -209,7 +217,7 @@ try {
   const exitCode = await exitPromise;
   await Promise.allSettled([stdoutDone, stderrDone]);
   if (exitCode !== 0 && !piCleanupKilled && !timedOut) {
-    throw new Error(`pi exited ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    throw new Error(`pi exited ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}\nproxy stdout:\n${proxyStdoutText}\nproxy stderr:\n${proxyStderrText}`);
   }
   assert(stdout.includes(EXPECTED), `Pi output did not include expected marker after cleanup. stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`);
 
@@ -220,6 +228,7 @@ try {
     auth_file_count: authFiles.length,
     model: MODEL,
     output: stdout.trim(),
+    proxy_impl: PROXY_IMPL,
     transport_stats: stats,
     sse_fallback_used: false,
     pi_cleanup_killed: piCleanupKilled,

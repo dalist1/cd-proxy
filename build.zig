@@ -38,6 +38,6 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
-    const run_step = b.step("run", "Run the Zig auth checker");
+    const run_step = b.step("run", "Run the pure Zig cd-proxy server; pass -- --check for check mode");
     run_step.dependOn(&run.step);
 }

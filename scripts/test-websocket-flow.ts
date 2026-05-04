@@ -26,19 +26,22 @@ async function writeAuth(dir: string, idx: number) {
     expired: "2099-01-01T00:00:00Z", last_refresh: "2026-01-01T00:00:00Z", disabled: false,
   }), { mode: 0o600 });
 }
-async function startMock(tmp: string, port: number) {
-  const file = join(tmp, "ws-mock.ts");
+async function startMock(tmp: string, port: number, failUpgradeAccounts: string[] = []) {
+  const file = join(tmp, `ws-mock-${port}.ts`);
   await writeFile(file, `
 const log = [];
+const failUpgrade = new Set((process.env.FAIL_UPGRADE_ACCOUNTS ?? '').split(',').filter(Boolean));
 Bun.serve({ host: '127.0.0.1', port: Number(process.env.MOCK_PORT),
   fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname === '/__health') return Response.json({ ok: true });
     if (url.pathname === '/__log') return Response.json(log);
+    if (url.pathname === '/__clear') { log.length = 0; return Response.json({ ok: true }); }
     if (url.pathname !== '/responses') return new Response('not found', { status: 404 });
     const account = req.headers.get('chatgpt-account-id');
     const auth = req.headers.get('authorization');
     log.push({ account, auth, beta: req.headers.get('openai-beta') });
+    if (failUpgrade.has(account ?? '')) return new Response('forced websocket upgrade failure', { status: 429 });
     if (server.upgrade(req, { data: { account } })) return;
     return new Response('upgrade failed', { status: 400 });
   },
@@ -47,7 +50,7 @@ Bun.serve({ host: '127.0.0.1', port: Number(process.env.MOCK_PORT),
   },
 });
 `);
-  const proc = Bun.spawn(["bun", file], { stdout: "pipe", stderr: "pipe", env: { ...process.env, MOCK_PORT: String(port) } });
+  const proc = Bun.spawn(["bun", file], { stdout: "pipe", stderr: "pipe", env: { ...process.env, MOCK_PORT: String(port), FAIL_UPGRADE_ACCOUNTS: failUpgradeAccounts.join(",") } });
   await waitFor(`http://127.0.0.1:${port}/__health`);
   return proc;
 }
@@ -99,7 +102,25 @@ try {
   const log = await (await fetch(`http://127.0.0.1:${mockPort}/__log`)).json() as any[];
   console.log("upstream handshakes:", log.map((x) => `${x.account}:${x.beta}`).join(" | "));
   assert(log.every((x) => x.beta === "responses_websockets=2026-02-06"), "OpenAI-Beta websocket header did not flow through");
-  console.log("websocket flow test: PASS");
 } finally {
   await stop(proxy); await stop(mock);
 }
+
+const failMockPort = 22700 + Math.floor(Math.random() * 1000);
+const failProxyPort = 23700 + Math.floor(Math.random() * 1000);
+try {
+  mock = await startMock(tmp, failMockPort, [ACCOUNTS[1]]);
+  proxy = await startProxy(authDir, failMockPort, failProxyPort);
+  const r0 = await wsRoundTrip(failProxyPort, "failover-one");
+  const r1 = await wsRoundTrip(failProxyPort, "failover-two");
+  const log = await (await fetch(`http://127.0.0.1:${failMockPort}/__log`)).json() as any[];
+  console.log("failover responses:", [r0.account, r1.account].join(" -> "));
+  console.log("failover handshakes:", log.map((x) => x.account).join(" -> "));
+  assert(r0.account === ACCOUNTS[0], `first failover WS account mismatch: ${r0.account}`);
+  assert(r1.account === ACCOUNTS[0], `failed B handshake should retry A without surfacing an error, got ${r1.account}`);
+  assert(log.map((x) => x.account).join(",") === [ACCOUNTS[0], ACCOUNTS[1], ACCOUNTS[0]].join(","), "WS failover handshake sequence mismatch");
+} finally {
+  await stop(proxy); await stop(mock);
+}
+
+console.log("websocket flow test: PASS");

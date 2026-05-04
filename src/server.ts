@@ -18,9 +18,11 @@ const EXPOSE_ROTATION_HEADERS = process.env.CD_PROXY_EXPOSE_ROTATION_HEADERS ===
 const USE_ZIG_AUTH_PARSE = process.env.CD_PROXY_ZIG_AUTH_PARSE === "1" || process.env.CD_PROXY_ZIG_AUTH_PARSE === "true";
 const USE_ZIG_JWT_EXP = process.env.CD_PROXY_ZIG_JWT_EXP === "1" || process.env.CD_PROXY_ZIG_JWT_EXP === "true";
 const USE_ZIG_PICK = process.env.CD_PROXY_ZIG_PICK === "1" || process.env.CD_PROXY_ZIG_PICK === "true";
-const MAX_RETRY_CREDENTIALS = Number(process.env.CD_PROXY_MAX_RETRY_CREDENTIALS ?? "5");
+const MAX_RETRY_CREDENTIALS = Number(process.env.CD_PROXY_MAX_RETRY_CREDENTIALS ?? "0");
 const COOLDOWN_MS = Number(process.env.CD_PROXY_COOLDOWN_MS ?? "30000");
 const REFRESH_SKEW_MS = Number(process.env.CD_PROXY_REFRESH_SKEW_MS ?? String(5 * 60_000));
+const WS_CONNECT_TIMEOUT_MS = Number(process.env.CD_PROXY_WS_CONNECT_TIMEOUT_MS ?? "10000");
+const RETRYABLE_HTTP_STATUSES = parseRetryableHttpStatuses(process.env.CD_PROXY_RETRYABLE_HTTP_STATUSES);
 const MODEL_IDS = (process.env.CD_PROXY_MODELS ?? "gpt-5.3-codex,gpt-5.3-codex-spark,codex-auto-review,gpt-5.5,gpt-5.2")
   .split(",")
   .map((s) => s.trim())
@@ -60,6 +62,7 @@ interface WsProxyData {
   upstream: WebSocket;
   upstreamOpen: boolean;
   queue: Array<string | ArrayBuffer | Uint8Array>;
+  downstreamQueue: Array<string | ArrayBuffer | Uint8Array>;
   authLabel: string;
 }
 
@@ -115,6 +118,29 @@ function assertNativeUpstreamBase(base: string) {
       `Unset CD_PROXY_UPSTREAM_BASE to use ${DEFAULT_CHATGPT_CODEX_BASE}, or point it at a non-production mock only for tests.`,
     );
   }
+}
+
+function parseRetryableHttpStatuses(raw: string | undefined): Set<number> {
+  const defaults = [401, 403, 408, 409, 425, 429, 500, 502, 503, 504];
+  const values = (raw ?? defaults.join(","))
+    .split(/[,\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n >= 400 && n <= 599);
+  return new Set(values.length ? values : defaults);
+}
+
+function maxCredentialAttempts(): number {
+  if (!Number.isFinite(MAX_RETRY_CREDENTIALS) || MAX_RETRY_CREDENTIALS <= 0) return Math.max(1, auths.length);
+  return Math.min(Math.floor(MAX_RETRY_CREDENTIALS), Math.max(1, auths.length));
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status >= 400 && RETRYABLE_HTTP_STATUSES.has(status);
+}
+
+function cooldownMsForFailure(status: number): number {
+  if (status === 401 || status === 403 || status === 429) return COOLDOWN_MS;
+  return Math.min(COOLDOWN_MS, 5000);
 }
 
 function log(...args: unknown[]) {
@@ -528,58 +554,118 @@ function isTerminalResponseEventPayload(payload: unknown): boolean {
   return isTerminalResponseEventText(text);
 }
 
+async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string, pathname: string): Promise<{ ok: true; data: WsProxyData } | { ok: false; status: number; detail: string }> {
+  const upstreamUrl = websocketUrlForPath(path);
+  const upstreamHeaders = buildWebSocketHeaders(req, a);
+  let upstream: WebSocket;
+  try {
+    upstream = new WebSocket(upstreamUrl, { headers: upstreamHeaders });
+  } catch (err) {
+    return { ok: false, status: 502, detail: String(err) };
+  }
+
+  const data: WsProxyData = { upstream, upstreamOpen: false, queue: [], downstreamQueue: [], authLabel: a.label };
+  const opened = await new Promise<{ ok: true } | { ok: false; status: number; detail: string }>((resolve) => {
+    let settled = false;
+    const finish = (result: { ok: true } | { ok: false; status: number; detail: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      try { upstream.close(); } catch {}
+      finish({ ok: false, status: 504, detail: `upstream websocket did not open within ${WS_CONNECT_TIMEOUT_MS}ms` });
+    }, Math.max(1, WS_CONNECT_TIMEOUT_MS));
+
+    upstream.addEventListener("open", () => {
+      transportStats.responsesWebSocketUpstreamOpens++;
+      data.upstreamOpen = true;
+      log(`WS ${pathname} -> ${upstreamUrl} as ${a.label}`);
+      for (const msg of data.queue.splice(0)) upstream.send(msg as any);
+      finish({ ok: true });
+    });
+    upstream.addEventListener("message", async (event: MessageEvent) => {
+      const payload = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+      const client = (upstream as any).__client;
+      if (client) client.send(payload as any);
+      else data.downstreamQueue.push(payload as any);
+      if (isTerminalResponseEventPayload(payload)) transportStats.responsesWebSocketTerminalEvents++;
+    });
+    upstream.addEventListener("close", (event: CloseEvent) => {
+      if (!data.upstreamOpen) {
+        finish({ ok: false, status: 502, detail: `upstream websocket closed before open: ${event.code || 1006} ${event.reason || ""}`.trim() });
+        return;
+      }
+      const client = (upstream as any).__client;
+      try { client?.close(event.code || 1000, event.reason || undefined); } catch {}
+    });
+    upstream.addEventListener("error", () => {
+      if (!data.upstreamOpen) {
+        finish({ ok: false, status: 502, detail: "upstream websocket error before open" });
+        return;
+      }
+      const client = (upstream as any).__client;
+      try { client?.close(1011, "upstream websocket error"); } catch {}
+    });
+  });
+
+  if (!opened.ok) {
+    try { upstream.close(); } catch {}
+    return opened;
+  }
+  return { ok: true, data };
+}
+
 async function proxyWebSocketUpgrade(req: Request, server: any, path: string, pathname: string): Promise<Response> {
   if (unauthorized(req)) return staticJsonResponse(UNAUTHORIZED_BODY, 401);
   if (auths.length === 0) return jsonResponse({ error: { message: `no codex auth files found in ${AUTH_DIR}` } }, { status: 503 });
 
   const tried: AuthEntry[] = [];
-  const a = chooseAuth(tried);
-  if (!a) return jsonResponse({ error: { message: "all codex credentials failed or are cooling down" } }, { status: 503 });
-  tried.push(a);
-  await ensureFresh(a);
+  let lastStatus = 0;
+  let lastText = "";
+  for (let attempt = 0; attempt < maxCredentialAttempts(); attempt++) {
+    const a = chooseAuth(tried);
+    if (!a) break;
+    tried.push(a);
 
-  const upstreamUrl = websocketUrlForPath(path);
-  const upstreamHeaders = buildWebSocketHeaders(req, a);
-  const upstream = new WebSocket(upstreamUrl, { headers: upstreamHeaders });
-  const queue: WsProxyData["queue"] = [];
-  const data: WsProxyData = { upstream, upstreamOpen: false, queue, authLabel: a.label };
+    try {
+      await ensureFresh(a);
+    } catch (err) {
+      lastStatus = 401;
+      lastText = String(err);
+      a.coolingUntil = Date.now() + COOLDOWN_MS;
+      log(`cooling ${a.label} after websocket refresh failure: ${lastText}`);
+      continue;
+    }
 
-  upstream.addEventListener("open", () => {
-    transportStats.responsesWebSocketUpstreamOpens++;
-    data.upstreamOpen = true;
-    log(`WS ${pathname} -> ${upstreamUrl} as ${a.label}`);
-    for (const msg of data.queue.splice(0)) upstream.send(msg as any);
-  });
-  upstream.addEventListener("message", async (event: MessageEvent) => {
-    const client = (upstream as any).__client;
-    if (!client) return;
-    const payload = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
-    client.send(payload as any);
-    if (isTerminalResponseEventPayload(payload)) transportStats.responsesWebSocketTerminalEvents++;
-  });
-  upstream.addEventListener("close", (event: CloseEvent) => {
-    const client = (upstream as any).__client;
-    try { client?.close(event.code || 1000, event.reason || undefined); } catch {}
-  });
-  upstream.addEventListener("error", () => {
-    const client = (upstream as any).__client;
-    try { client?.close(1011, "upstream websocket error"); } catch {}
-  });
+    const connected = await connectUpstreamWebSocket(req, a, path, pathname);
+    if (!connected.ok) {
+      lastStatus = connected.status;
+      lastText = connected.detail;
+      a.coolingUntil = Date.now() + cooldownMsForFailure(connected.status);
+      log(`cooling ${a.label} after websocket connect failure: ${connected.detail}`);
+      continue;
+    }
 
-  const ok = server.upgrade(req, {
-    data,
-    headers: EXPOSE_ROTATION_HEADERS ? {
-      "x-cd-proxy-auth-label": a.label,
-      ...(a.data.account_id ? { "x-cd-proxy-auth-account-prefix": a.data.account_id.slice(0, 5) } : {}),
-      "x-cd-proxy-next-rr-index": String(rr % Math.max(1, auths.length)),
-    } : undefined,
-  });
-  if (!ok) {
-    upstream.close();
-    return staticJsonResponse(WS_UPGRADE_FAILED_BODY, 400);
+    const ok = server.upgrade(req, {
+      data: connected.data,
+      headers: EXPOSE_ROTATION_HEADERS ? {
+        "x-cd-proxy-auth-label": a.label,
+        ...(a.data.account_id ? { "x-cd-proxy-auth-account-prefix": a.data.account_id.slice(0, 5) } : {}),
+        "x-cd-proxy-attempt": String(attempt),
+        "x-cd-proxy-next-rr-index": String(rr % Math.max(1, auths.length)),
+      } : undefined,
+    });
+    if (!ok) {
+      try { connected.data.upstream.close(); } catch {}
+      return staticJsonResponse(WS_UPGRADE_FAILED_BODY, 400);
+    }
+    transportStats.responsesWebSocketUpgrades++;
+    return undefined as any;
   }
-  transportStats.responsesWebSocketUpgrades++;
-  return undefined as any;
+
+  return jsonResponse({ error: { message: "all codex websocket credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
 }
 
 async function proxyWithRotation(req: Request, path: string, pathname: string): Promise<Response> {
@@ -588,14 +674,14 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
   let lastStatus = 0;
   let lastText = "";
   const requestBody = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();
+  const upstream = upstreamHttpUrlForPath(path);
 
-  for (let attempt = 0; attempt < Math.min(MAX_RETRY_CREDENTIALS, Math.max(1, auths.length)); attempt++) {
+  for (let attempt = 0; attempt < maxCredentialAttempts(); attempt++) {
     const a = chooseAuth(tried);
     if (!a) break;
     tried.push(a);
     try {
       await ensureFresh(a);
-      const upstream = upstreamHttpUrlForPath(path);
       log(`${req.method} ${pathname} -> ${upstream} as ${a.label}`);
       const res = await fetch(upstream, {
         method: req.method,
@@ -617,21 +703,22 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
             // @ts-ignore
             duplex: "half",
           });
-          if (retry.ok || retry.status < 400 || retry.status === 400) return withRotationHeaders(retry, a, attempt);
+          if (!isRetryableHttpStatus(retry.status)) return withRotationHeaders(retry, a, attempt);
           lastStatus = retry.status;
           lastText = await retry.text().catch(() => "");
         } catch (err) {
           lastText = String(err);
         }
         a.coolingUntil = Date.now() + COOLDOWN_MS;
+        log(`cooling ${a.label} after 401/refresh retry failure: ${lastStatus} ${lastText.slice(0, 160)}`);
         continue;
       }
 
-      if (res.status === 429) {
+      if (isRetryableHttpStatus(res.status)) {
         lastStatus = res.status;
         lastText = await res.text().catch(() => "");
-        a.coolingUntil = Date.now() + COOLDOWN_MS;
-        log(`cooling ${a.label} after 429`);
+        a.coolingUntil = Date.now() + cooldownMsForFailure(res.status);
+        log(`cooling ${a.label} after retryable upstream status ${res.status}: ${lastText.slice(0, 160)}`);
         continue;
       }
 
@@ -639,7 +726,8 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
     } catch (err) {
       lastStatus = 502;
       lastText = String(err);
-      a.coolingUntil = Date.now() + Math.min(COOLDOWN_MS, 5000);
+      a.coolingUntil = Date.now() + cooldownMsForFailure(502);
+      log(`cooling ${a.label} after upstream fetch failure: ${lastText.slice(0, 160)}`);
     }
   }
 
@@ -701,6 +789,7 @@ Bun.serve({
   websocket: {
     open(ws: ServerWebSocket<WsProxyData>) {
       (ws.data.upstream as any).__client = ws;
+      for (const msg of ws.data.downstreamQueue.splice(0)) ws.send(msg as any);
     },
     message(ws: ServerWebSocket<WsProxyData>, message: string | Buffer) {
       if (ws.data.upstreamOpen) ws.data.upstream.send(message as any);

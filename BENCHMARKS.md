@@ -14,6 +14,9 @@ Run the local-loop macro benchmark against a mock upstream:
 
 ```bash
 bun run bench:local-loop
+# compare runtimes
+CD_PROXY_BENCH_IMPL=bun bun run bench:local-loop
+CD_PROXY_BENCH_IMPL=zig bun run bench:local-loop
 ```
 
 For a longer run:
@@ -64,25 +67,26 @@ Results:
 
 ## Latest local-loop macro result
 
-Command:
+Commands:
 
 ```bash
-bun run bench:local-loop
+CD_PROXY_BENCH_IMPL=bun CD_PROXY_BENCH_FAST=1 bun run bench:local-loop
+CD_PROXY_BENCH_IMPL=zig CD_PROXY_BENCH_FAST=1 bun run bench:local-loop
 ```
 
-Results:
+Runtime comparison:
 
-| Path | Throughput | Avg latency |
-| --- | ---: | ---: |
-| Proxy `GET /v1/models` | 5,116.5 ops/s | 0.195 ms |
-| Direct mock `POST /responses` | 7,968.1 ops/s | 0.126 ms |
-| Proxy `POST /v1/responses` | 2,168.4 ops/s | 0.461 ms |
-| Direct mock WS open + roundtrip | 4,793.8 ops/s | 0.209 ms |
-| Proxy WS open + roundtrip | 1,457.4 ops/s | 0.686 ms |
+| Path | Bun fallback | Pure Zig | Change |
+| --- | ---: | ---: | ---: |
+| Proxy `GET /v1/models` avg latency | 0.147 ms | 0.189 ms | Zig 1.29x slower |
+| Proxy `POST /v1/responses` avg latency | 0.319 ms | 0.184 ms | Zig 1.73x faster |
+| Proxy `POST /v1/responses` throughput | 3,137.6 ops/s | 5,444.5 ops/s | Zig 1.74x faster |
+| Proxy WS open + roundtrip avg latency | 0.694 ms | 1.706 ms | Zig 2.46x slower |
+| Proxy WS open + roundtrip throughput | 1,441.6 ops/s | 586.3 ops/s | Zig 0.41x throughput |
 
-Measured proxy overhead in that run:
+Measured pure Zig proxy overhead in that run:
 
-- HTTP Responses POST: 0.336 ms/request over direct mock upstream.
-- WebSocket open + one frame: 0.478 ms/request over direct mock upstream.
+- HTTP Responses POST: 0.064 ms/request over direct mock upstream.
+- WebSocket open + one frame: 1.509 ms/request over direct mock upstream.
 
-The goal is a very quick request/response feedback loop, not full upstream network benchmarking.
+Takeaway: the pure Zig port already improves the HTTP Responses proxy hot path substantially, while the initial WebSocket bridge prioritizes correctness/parity and still has optimization headroom.

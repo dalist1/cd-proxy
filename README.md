@@ -2,7 +2,7 @@
 
 Native Codex-only proxy in **Bun**, plus a small **Zig** rotation/auth checker.
 
-- runtime starts `bun run src/server.ts`
+- runtime starts `zig-out/bin/cd-proxy-zig --serve` (pure Zig); the Bun implementation remains as `bun run start:bun` for fallback/comparison
 - default upstream is the real Codex backend: `https://chatgpt.com/backend-api/codex`
 - browser OAuth, device-code OAuth, token refresh, credential storage, request handling, routing, retries, and WebSockets are implemented here
 
@@ -39,7 +39,7 @@ ChatGPT/Codex API access uses:
 ## Bun proxy
 
 ```bash
-bun run src/server.ts --check
+bun run check
 bun run start
 ```
 
@@ -85,9 +85,9 @@ Round-robin behavior:
 1. Loads `codex-*.json` auth files from the cd-proxy auth dir.
 2. Picks the next enabled credential for every HTTP request and WebSocket connection.
 3. Refreshes a credential before use if its expiry is near.
-4. On HTTP `401`, refreshes and retries once.
-5. On HTTP `429`, cools that credential briefly and rotates to the next credential.
-6. For WebSockets, cd-proxy forwards the upgrade to the Codex Responses endpoint and freely pipes frames both ways; Codex headers such as `OpenAI-Beta: responses_websockets=2026-02-06`, `x-client-request-id`, `session_id`, and turn-state metadata are preserved.
+4. On HTTP `401`, refreshes and retries once before rotating away from that credential.
+5. On retryable HTTP failures (`401,403,408,409,425,429,500,502,503,504` by default), cools that credential and retries the next account inside the same external request instead of surfacing that failure to the client.
+6. For WebSockets, cd-proxy first opens the upstream Codex WebSocket with the selected account; if that handshake fails, it rotates to the next account before upgrading the client connection. Once connected, it freely pipes frames both ways; Codex headers such as `OpenAI-Beta: responses_websockets=2026-02-06`, `x-client-request-id`, `session_id`, and turn-state metadata are preserved.
 
 Useful env vars:
 
@@ -97,8 +97,10 @@ CD_PROXY_PORT=8318
 CD_PROXY_AUTH_DIR=~/.local/share/cd-proxy/auths
 CD_PROXY_API_KEY_FILE=~/.config/cd-proxy/api-key
 CD_PROXY_API_KEY=override-local-bearer-key
-CD_PROXY_MAX_RETRY_CREDENTIALS=5
+CD_PROXY_MAX_RETRY_CREDENTIALS=0     # 0/default means try every enabled credential before surfacing failure
 CD_PROXY_COOLDOWN_MS=30000
+CD_PROXY_RETRYABLE_HTTP_STATUSES=401,403,408,409,425,429,500,502,503,504
+CD_PROXY_WS_CONNECT_TIMEOUT_MS=10000
 CD_PROXY_DEBUG=1
 CD_PROXY_MODELS=gpt-5.3-codex,codex-auto-review
 CD_PROXY_ZIG_AUTH_PARSE=0   # opt-in only; benchmark before enabling
@@ -113,13 +115,20 @@ The Zig side now has two pieces:
 - `zig-src/core.zig` builds `zig-out/lib/libcd_proxy_core.so`, a native hot-path helper used by Bun through `bun:ffi` when present. It handles binary-frame terminal WebSocket event detection without per-frame JS `JSON.parse`; compact text frames use an even faster JS sentinel path. The Zig core also includes opt-in helpers for JWT `exp` decoding, auth-file JSON extraction, and large-pool credential scans.
 - `zig-src/main.zig` builds `zig-out/bin/cd-proxy-zig`, a fast auth-dir checker that prints redacted account prefixes.
 
-`bun run start` and `bun run check` try to build ReleaseFast Zig artifacts first, then gracefully fall back to the TypeScript implementation if Zig is unavailable.
+`bun run start` and `bun run check` build ReleaseFast Zig artifacts and run the pure Zig server/checker. The previous Bun implementation remains available as `bun run start:bun` / `bun run check:bun` for fallback/comparison.
+
+The pure Zig server in `zig-src/main.zig` builds to `zig-out/bin/cd-proxy-zig`. It supports native auth loading, health/status/models, reload/debug rotation, HTTP Responses proxying, WebSocket upgrade/proxying, terminal WebSocket event detection, same-request round-robin failover for retryable HTTP and WebSocket handshake failures, real Pi/Codex WSS smoke-test parity, and refresh-token persistence on refresh.
 
 ```bash
 zig build test
 zig build -p zig-out
-./zig-out/bin/cd-proxy-zig
-bun run check   # shows native_implementation: true and zig_core status
+./zig-out/bin/cd-proxy-zig --check
+bun run start         # run the pure Zig server on CD_PROXY_HOST/CD_PROXY_PORT
+bun run start:bun     # optional Bun fallback/comparison runtime
+bun run test:zig-http # pure Zig HTTP round-robin/failover parity smoke test
+bun run test:zig-ws   # pure Zig WebSocket proxy/failover parity smoke test
+CD_PROXY_REAL_WS_IMPL=zig bun run test:pi-real-ws  # real Pi/Codex WSS smoke test
+bun run check         # shows native_implementation: true and pure_zig: true
 bun run assert:native
 bun run bench              # request/response hot-path microbenchmarks; see BENCHMARKS.md
 bun run bench:local-loop   # local mock-upstream macro benchmark
@@ -196,6 +205,8 @@ Run the native auth checks plus the granular rotation suite. The auth check veri
 - exact A → B → C → A → B → C per-request routing
 - disabled credentials are skipped after `/reload`
 - `429` cools the failing credential and retries the next credential in the same external request
+- `5xx` upstream failures are retried on the next credential instead of being returned when another account succeeds
+- WebSocket upstream handshake failures rotate to the next credential before the client is upgraded
 - the mock upstream saw the attempted failing credential before the retry
 
 ```bash

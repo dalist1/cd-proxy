@@ -1,5 +1,5 @@
 [Unit]
-Description=cd-proxy minimal Codex OAuth proxy
+Description=cd-proxy pure Zig Codex OAuth proxy
 After=network-online.target
 
 [Service]

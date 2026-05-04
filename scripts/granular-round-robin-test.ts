@@ -72,11 +72,14 @@ async function clearLog(mockPort: number) {
   await fetch(`http://127.0.0.1:${mockPort}/__clear`, { method: "POST" });
 }
 
-async function startMock(tmp: string, mockPort: number, fail429Accounts: string[] = []) {
+async function startMock(tmp: string, mockPort: number, failStatuses: Record<string, number> = {}) {
   const file = join(tmp, `mock-${mockPort}.ts`);
   await writeFile(file, `
 const log = [];
-const fail429 = new Set((process.env.FAIL_429_ACCOUNTS ?? '').split(',').filter(Boolean));
+const failStatuses = new Map((process.env.FAIL_STATUSES ?? '').split(',').filter(Boolean).map((item) => {
+  const [account, status] = item.split('=');
+  return [account, Number(status)];
+}));
 Bun.serve({ host: '127.0.0.1', port: Number(process.env.MOCK_PORT), fetch(req) {
   const url = new URL(req.url);
   if (url.pathname === '/__health') return Response.json({ ok: true });
@@ -85,14 +88,15 @@ Bun.serve({ host: '127.0.0.1', port: Number(process.env.MOCK_PORT), fetch(req) {
   const account = req.headers.get('chatgpt-account-id');
   const item = { path: url.pathname, account, auth: req.headers.get('authorization') };
   log.push(item);
-  if (fail429.has(account ?? '')) return Response.json({ error: 'forced 429', account }, { status: 429 });
+  const forced = failStatuses.get(account ?? '');
+  if (forced) return Response.json({ error: 'forced ' + forced, account }, { status: forced });
   return Response.json({ ok: true, ...item });
 }});
 `);
   const proc = Bun.spawn(["bun", file], {
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, MOCK_PORT: String(mockPort), FAIL_429_ACCOUNTS: fail429Accounts.join(",") },
+    env: { ...process.env, MOCK_PORT: String(mockPort), FAIL_STATUSES: Object.entries(failStatuses).map(([account, status]) => `${account}=${status}`).join(",") },
   });
   await waitFor(`http://127.0.0.1:${mockPort}/__health`);
   return proc;
@@ -166,7 +170,7 @@ async function main() {
   await writeAuth(authDir, 1, false);
   const mockPort2 = 19510 + Math.floor(Math.random() * 1000);
   const proxyPort2 = 9350 + Math.floor(Math.random() * 1000);
-  mock = await startMock(tmp, mockPort2, [ACCOUNTS[1]]);
+  mock = await startMock(tmp, mockPort2, { [ACCOUNTS[1]]: 429 });
   proxy = await startProxy(authDir, mockPort2, proxyPort2);
   try {
     console.log("scenario 3: 429 cools failing credential and retries next credential");
@@ -182,6 +186,28 @@ async function main() {
     assert(returned.join(",") === [ACCOUNTS[0], ACCOUNTS[2], ACCOUNTS[0], ACCOUNTS[2]].join(","), "429 returned sequence mismatch");
     assert(tried.slice(0, 5).join(",") === [ACCOUNTS[0], ACCOUNTS[1], ACCOUNTS[2], ACCOUNTS[0], ACCOUNTS[2]].join(","), "429 upstream tried sequence mismatch");
     assert(r1.attempt === "1", `429 retry response should expose attempt=1, got ${r1.attempt}`);
+  } finally {
+    await stop(proxy);
+    await stop(mock);
+  }
+
+  const mockPort3 = 20510 + Math.floor(Math.random() * 1000);
+  const proxyPort3 = 10350 + Math.floor(Math.random() * 1000);
+  mock = await startMock(tmp, mockPort3, { [ACCOUNTS[1]]: 500 });
+  proxy = await startProxy(authDir, mockPort3, proxyPort3);
+  try {
+    console.log("scenario 4: 5xx upstream failure retries next credential without surfacing 5xx");
+    const r0 = await request(proxyPort3);
+    const r1 = await request(proxyPort3);
+    const returned = [r0.body.account, r1.body.account];
+    const log = await getLog(mockPort3);
+    const tried = log.map((x) => x.account);
+    console.log("returned:", returned.join(" -> "));
+    console.log("upstream tried:", tried.join(" -> "));
+    assert(r0.status === 200 && r1.status === 200, `5xx retry should return successes, got ${r0.status}/${r1.status}`);
+    assert(returned.join(",") === [ACCOUNTS[0], ACCOUNTS[2]].join(","), "5xx returned sequence mismatch");
+    assert(tried.slice(0, 3).join(",") === [ACCOUNTS[0], ACCOUNTS[1], ACCOUNTS[2]].join(","), "5xx upstream tried sequence mismatch");
+    assert(r1.attempt === "1", `5xx retry response should expose attempt=1, got ${r1.attempt}`);
   } finally {
     await stop(proxy);
     await stop(mock);
