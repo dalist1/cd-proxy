@@ -1,8 +1,8 @@
 # cd-proxy
 
-Native Codex-only proxy in **Bun**, plus a small **Zig** rotation/auth checker.
+Native Codex-only proxy in **Bun**, with **Zig** hot-path helpers.
 
-- runtime starts `zig-out/bin/cd-proxy-zig --serve` (pure Zig); the Bun implementation remains as `bun run start:bun` for fallback/comparison
+- default/runtime path is Bun (`bun run start`) to keep WebSocket latency/throughput fastest
 - default upstream is the real Codex backend: `https://chatgpt.com/backend-api/codex`
 - browser OAuth, device-code OAuth, token refresh, credential storage, request handling, routing, retries, and WebSockets are implemented here
 
@@ -110,25 +110,18 @@ CD_PROXY_ZIG_PICK=0         # opt-in only for very large auth pools
 
 ## Zig acceleration
 
-The Zig side now has two pieces:
+The Zig side is used for hot-path helpers and checks:
 
 - `zig-src/core.zig` builds `zig-out/lib/libcd_proxy_core.so`, a native hot-path helper used by Bun through `bun:ffi` when present. It handles binary-frame terminal WebSocket event detection without per-frame JS `JSON.parse`; compact text frames use an even faster JS sentinel path. The Zig core also includes opt-in helpers for JWT `exp` decoding, auth-file JSON extraction, and large-pool credential scans.
-- `zig-src/main.zig` builds `zig-out/bin/cd-proxy-zig`, a fast auth-dir checker that prints redacted account prefixes.
+- `zig-src/main.zig` builds `zig-out/bin/cd-proxy-zig` for native auth/HTTP parity checks. Its old WebSocket proxy path was removed because Bun is faster for WebSockets.
 
-`bun run start` and `bun run check` build ReleaseFast Zig artifacts and run the pure Zig server/checker. The previous Bun implementation remains available as `bun run start:bun` / `bun run check:bun` for fallback/comparison.
-
-The pure Zig server in `zig-src/main.zig` builds to `zig-out/bin/cd-proxy-zig`. It supports native auth loading, health/status/models, reload/debug rotation, HTTP Responses proxying, WebSocket upgrade/proxying, terminal WebSocket event detection, same-request round-robin failover for retryable HTTP and WebSocket handshake failures, real Pi/Codex WSS smoke-test parity, and refresh-token persistence on refresh.
+`bun run start` and `bun run check` use the Bun runtime, while still building ReleaseFast Zig artifacts when available for `bun:ffi` hot-path helpers.
 
 ```bash
 zig build test
-zig build -p zig-out
-./zig-out/bin/cd-proxy-zig --check
-bun run start         # run the pure Zig server on CD_PROXY_HOST/CD_PROXY_PORT
-bun run start:bun     # optional Bun fallback/comparison runtime
-bun run test:zig-http # pure Zig HTTP round-robin/failover parity smoke test
-bun run test:zig-ws   # pure Zig WebSocket proxy/failover parity smoke test
-CD_PROXY_REAL_WS_IMPL=zig bun run test:pi-real-ws  # real Pi/Codex WSS smoke test
-bun run check         # shows native_implementation: true and pure_zig: true
+bun run zig:build
+bun run start        # Bun runtime on CD_PROXY_HOST/CD_PROXY_PORT; fastest WebSocket path
+bun run check        # Bun runtime check
 bun run assert:native
 bun run bench              # request/response hot-path microbenchmarks; see BENCHMARKS.md
 bun run bench:local-loop   # local mock-upstream macro benchmark

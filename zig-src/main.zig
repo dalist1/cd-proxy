@@ -54,26 +54,6 @@ const Stats = struct {
     responses_websocket_terminal_events: u64 = 0,
 };
 
-const WsOpcode = enum(u4) {
-    continuation = 0,
-    text = 1,
-    binary = 2,
-    close = 8,
-    ping = 9,
-    pong = 10,
-    _,
-};
-
-const WsFrame = struct {
-    opcode: WsOpcode,
-    payload: []u8,
-};
-
-const UpstreamWebSocket = struct {
-    request: std.http.Client.Request,
-    auth_idx: usize,
-};
-
 const State = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -262,7 +242,7 @@ fn targetQueryParam(allocator: std.mem.Allocator, target: []const u8, name: []co
     return null;
 }
 
-const UpstreamPath = enum { models, responses, responses_compact, websocket };
+const UpstreamPath = enum { models, responses, responses_compact };
 
 fn upstreamPath(path: []const u8) ?UpstreamPath {
     if (std.mem.eql(u8, path, "/v1/models") or std.mem.eql(u8, path, "/models")) return .models;
@@ -294,13 +274,6 @@ fn upstreamUrl(allocator: std.mem.Allocator, state: *State, path: UpstreamPath) 
         .responses_compact => try std.fmt.allocPrint(allocator, "{s}/responses/compact", .{state.config.upstream_base}),
         else => unreachable,
     };
-}
-
-fn upstreamWsUrl(allocator: std.mem.Allocator, state: *State) ![]const u8 {
-    const base = state.config.upstream_base;
-    if (std.mem.startsWith(u8, base, "https://")) return std.fmt.allocPrint(allocator, "wss://{s}/responses", .{base[8..]});
-    if (std.mem.startsWith(u8, base, "http://")) return std.fmt.allocPrint(allocator, "ws://{s}/responses", .{base[7..]});
-    return std.fmt.allocPrint(allocator, "{s}/responses", .{base});
 }
 
 fn isRetryable(status: u16) bool {
@@ -495,65 +468,6 @@ fn respondDebugRotation(state: *State, req: *std.http.Server.Request, target: []
     try respondJson(req, w.writer.buffered(), 200);
 }
 
-fn randomWebSocketKey(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
-    var raw: [16]u8 = undefined;
-    io.random(&raw);
-    const out = try allocator.alloc(u8, 24);
-    _ = std.base64.standard.Encoder.encode(out, &raw);
-    return out;
-}
-
-fn shouldForwardWsHeader(name: []const u8) bool {
-    return !(std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "upgrade") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "sec-websocket-key") or
-        std.ascii.eqlIgnoreCase(name, "sec-websocket-version") or
-        std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions") or
-        std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol") or
-        std.ascii.eqlIgnoreCase(name, "authorization"));
-}
-
-fn wsHeadersForAuth(state: *State, allocator: std.mem.Allocator, req: *const std.http.Server.Request, auth: *const AuthEntry) ![]std.http.Header {
-    var list: std.ArrayList(std.http.Header) = .empty;
-    var it = req.iterateHeaders();
-    while (it.next()) |h| {
-        if (shouldForwardWsHeader(h.name)) try list.append(allocator, .{ .name = h.name, .value = h.value });
-    }
-    try list.append(allocator, .{ .name = "upgrade", .value = "websocket" });
-    try list.append(allocator, .{ .name = "sec-websocket-version", .value = "13" });
-    try list.append(allocator, .{ .name = "sec-websocket-key", .value = try randomWebSocketKey(state.io, allocator) });
-    try list.append(allocator, .{ .name = "authorization", .value = try bearerValue(allocator, auth.data.access_token) });
-    if (auth.data.account_id) |id| try list.append(allocator, .{ .name = "ChatGPT-Account-ID", .value = id });
-    return list.toOwnedSlice(allocator);
-}
-
-fn connectUpstreamWebSocket(state: *State, allocator: std.mem.Allocator, req: *const std.http.Server.Request, auth: *AuthEntry, auth_idx: usize, status_out: *u16) !UpstreamWebSocket {
-    const url = try upstreamWsUrl(allocator, state);
-    const uri = try std.Uri.parse(url);
-    const headers = try wsHeadersForAuth(state, allocator, req, auth);
-    var upstream_req = try state.http_client.request(.GET, uri, .{
-        .keep_alive = false,
-        .headers = .{ .connection = .{ .override = "Upgrade" }, .authorization = .omit },
-        .extra_headers = headers,
-        .redirect_behavior = .unhandled,
-    });
-    errdefer upstream_req.deinit();
-    try upstream_req.sendBodiless();
-    var redirect_buffer: [8192]u8 = undefined;
-    const response = try upstream_req.receiveHead(&redirect_buffer);
-    const status: u16 = @intFromEnum(response.head.status);
-    status_out.* = status;
-    if (status != 101) {
-        log(state, "upstream websocket status {d}", .{status});
-        return error.WebSocketUpgradeFailed;
-    }
-    log(state, "upstream websocket open as {s}", .{auth.label});
-    state.stats.responses_websocket_upstream_opens += 1;
-    return .{ .request = upstream_req, .auth_idx = auth_idx };
-}
-
 fn proxyHttp(state: *State, req: *std.http.Server.Request, path: UpstreamPath, allocator: std.mem.Allocator) !void {
     if (path == .responses or path == .responses_compact) state.stats.responses_http_requests += 1;
     if (state.auths.len == 0) return respondJson(req, "{\"error\":{\"message\":\"no codex auth files found\"}}", 503);
@@ -608,140 +522,8 @@ fn isWsUpgrade(req: *const std.http.Server.Request) bool {
     return false;
 }
 
-fn readWsFrame(allocator: std.mem.Allocator, reader: *std.Io.Reader, expect_masked: bool) !?WsFrame {
-    const b0 = reader.takeByte() catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => |e| return e,
-    };
-    const b1 = try reader.takeByte();
-    const opcode: WsOpcode = @enumFromInt(b0 & 0x0f);
-    const masked = (b1 & 0x80) != 0;
-    if (masked != expect_masked) return error.InvalidWebSocketMask;
-    var len: usize = b1 & 0x7f;
-    if (len == 126) len = try reader.takeInt(u16, .big)
-    else if (len == 127) len = std.math.cast(usize, try reader.takeInt(u64, .big)) orelse return error.WebSocketMessageTooLarge;
-    if (len > 16 * 1024 * 1024) return error.WebSocketMessageTooLarge;
-    var mask: [4]u8 = .{ 0, 0, 0, 0 };
-    if (masked) mask = (try reader.takeArray(4)).*;
-    const payload = try allocator.alloc(u8, len);
-    errdefer allocator.free(payload);
-    if (len > 0) {
-        const got = try reader.readSliceShort(payload);
-        if (got != payload.len) return error.EndOfStream;
-        if (masked) {
-            for (payload, 0..) |*c, i| c.* ^= mask[i % 4];
-        }
-    }
-    return .{ .opcode = opcode, .payload = payload };
-}
-
-fn writeWsFrame(io: std.Io, writer: *std.Io.Writer, opcode: WsOpcode, payload: []const u8, masked: bool) !void {
-    try writer.writeByte(@as(u8, 0x80) | @as(u8, @intCast(@intFromEnum(opcode))));
-    if (payload.len <= 125) {
-        try writer.writeByte((if (masked) @as(u8, 0x80) else 0) | @as(u8, @intCast(payload.len)));
-    } else if (payload.len <= 0xffff) {
-        try writer.writeByte((if (masked) @as(u8, 0x80) else 0) | 126);
-        try writer.writeInt(u16, @intCast(payload.len), .big);
-    } else {
-        try writer.writeByte((if (masked) @as(u8, 0x80) else 0) | 127);
-        try writer.writeInt(u64, payload.len, .big);
-    }
-    if (masked) {
-        var mask: [4]u8 = undefined;
-        io.random(&mask);
-        try writer.writeAll(&mask);
-        for (payload, 0..) |c, i| try writer.writeByte(c ^ mask[i % 4]);
-    } else {
-        try writer.writeAll(payload);
-    }
-    try writer.flush();
-}
-
-fn isTerminalPayload(payload: []const u8) bool {
-    return std.mem.indexOf(u8, payload, "response.completed") != null or
-        std.mem.indexOf(u8, payload, "response.done") != null or
-        std.mem.indexOf(u8, payload, "response.incomplete") != null;
-}
-
-fn clientToUpstreamLoop(io: std.Io, allocator: std.mem.Allocator, client_reader: *std.Io.Reader, upstream_writer: *std.Io.Writer) void {
-    while (true) {
-        const frame = readWsFrame(allocator, client_reader, true) catch break;
-        const f = frame orelse break;
-        defer allocator.free(f.payload);
-        writeWsFrame(io, upstream_writer, f.opcode, f.payload, true) catch break;
-        if (f.opcode == .close) break;
-    }
-}
-
-fn bridgeWebSockets(state: *State, allocator: std.mem.Allocator, client_ws: *std.http.Server.WebSocket, upstream: *UpstreamWebSocket) !void {
-    _ = allocator;
-    const frame_allocator = state.gpa;
-    const upstream_conn = upstream.request.connection orelse return error.WebSocketUpgradeFailed;
-    const upstream_writer = upstream_conn.writer();
-    const upstream_reader = upstream_conn.reader();
-    const t = try std.Thread.spawn(.{}, clientToUpstreamLoop, .{ state.io, frame_allocator, client_ws.input, upstream_writer });
-    defer t.join();
-    while (true) {
-        const frame = try readWsFrame(frame_allocator, upstream_reader, false) orelse break;
-        defer frame_allocator.free(frame.payload);
-        if ((frame.opcode == .text or frame.opcode == .binary) and isTerminalPayload(frame.payload)) state.stats.responses_websocket_terminal_events += 1;
-        try writeWsFrame(state.io, client_ws.output, frame.opcode, frame.payload, false);
-        if (frame.opcode == .close) break;
-    }
-}
-
-fn proxyWebSocket(state: *State, req: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
-    if (state.auths.len == 0) return respondJson(req, "{\"error\":{\"message\":\"no codex auth files found\"}}", 503);
-    const upgrade = req.upgradeRequested();
-    const key = switch (upgrade) {
-        .websocket => |k| k orelse return respondJson(req, "{\"error\":{\"message\":\"missing websocket key\"}}", 400),
-        else => return respondJson(req, "{\"error\":{\"message\":\"websocket endpoint not found\"}}", 404),
-    };
-
-    var tried: [1024]usize = undefined;
-    var tried_len: usize = 0;
-    var last_status: u16 = 503;
-    var upstream: ?UpstreamWebSocket = null;
-    var attempt: usize = 0;
-    while (attempt < maxAttempts(state)) : (attempt += 1) {
-        const idx = chooseAuth(state, tried[0..tried_len]) orelse break;
-        tried[tried_len] = idx;
-        tried_len += 1;
-        const auth = &state.auths[idx];
-        var ws_status: u16 = 0;
-        upstream = connectUpstreamWebSocket(state, allocator, req, auth, idx, &ws_status) catch |err| blk: {
-            if (ws_status == 401) {
-                refreshAuth(state, allocator, auth) catch {};
-                ws_status = 0;
-                break :blk connectUpstreamWebSocket(state, allocator, req, auth, idx, &ws_status) catch |retry_err| {
-                    last_status = if (ws_status != 0) ws_status else 502;
-                    auth.cooling_until_ms = nowMs(state.io) + cooldownFor(state, last_status);
-                    log(state, "cooling {s} after websocket refresh/connect error {s}", .{ auth.label, @errorName(retry_err) });
-                    continue;
-                };
-            }
-            last_status = if (ws_status != 0) ws_status else 502;
-            auth.cooling_until_ms = nowMs(state.io) + cooldownFor(state, last_status);
-            log(state, "cooling {s} after websocket connect error {s}", .{ auth.label, @errorName(err) });
-            continue;
-        };
-        break;
-    }
-    var up = upstream orelse return respondJson(req, "{\"error\":{\"message\":\"all codex websocket credentials failed or are cooling down\"}}", last_status);
-    defer up.request.deinit();
-
-    var extra_headers: [3]std.http.Header = .{
-        .{ .name = "x-cd-proxy-native", .value = "pure-zig" },
-        .{ .name = "x-cd-proxy-auth-label", .value = state.auths[up.auth_idx].label },
-        .{ .name = "x-cd-proxy-unused", .value = "" },
-    };
-    const headers = if (state.config.expose_rotation_headers) extra_headers[0..2] else extra_headers[0..1];
-    var client_ws = try req.respondWebSocket(.{ .key = key, .extra_headers = headers });
-    try client_ws.flush();
-    state.stats.responses_websocket_upgrades += 1;
-    bridgeWebSockets(state, allocator, &client_ws, &up) catch |err| {
-        log(state, "websocket bridge closed: {s}", .{@errorName(err)});
-    };
+fn respondWebSocketUnsupported(req: *std.http.Server.Request) !void {
+    return respondJson(req, "{\"error\":{\"message\":\"pure Zig WebSocket proxy was removed; use the default Bun runtime\"}}", 501);
 }
 
 fn handleRequest(state: *State, req: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
@@ -753,7 +535,7 @@ fn handleRequest(state: *State, req: *std.http.Server.Request, allocator: std.me
         if (unauthorized(state, req)) return respondJson(req, "{\"error\":{\"message\":\"unauthorized\"}}", 401);
         const up = upstreamPath(path) orelse return respondJson(req, "{\"error\":{\"message\":\"websocket endpoint not found\"}}", 404);
         if (up != .responses) return respondJson(req, "{\"error\":{\"message\":\"websocket endpoint not found\"}}", 404);
-        return proxyWebSocket(state, req, allocator);
+        return respondWebSocketUnsupported(req);
     }
     if (std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/v1/health")) return respondHealth(state, req, allocator);
     if (std.mem.eql(u8, path, "/reload") and req.head.method == .POST) {

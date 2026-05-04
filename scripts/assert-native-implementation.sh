@@ -35,13 +35,13 @@ if grep -RInE 'codex login|CODEX_HOME=.*codex' \
 fi
 rm -f /tmp/cd-proxy-native-auth.$$
 
-# The native/pure-Zig implementations must keep using the real Codex backend as their default upstream.
+# The native Bun runtime and Zig helper/checker must keep using the real Codex backend as their default upstream.
 grep -q 'DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex"' src/server.ts \
-  || fail "Bun fallback default upstream is not the native ChatGPT Codex backend"
+  || fail "Bun runtime default upstream is not the native ChatGPT Codex backend"
 grep -q 'DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex"' zig-src/main.zig \
   || fail "pure Zig default upstream is not the native ChatGPT Codex backend"
-grep -q 'ExecStart=%h/cd-proxy/zig-out/bin/cd-proxy-zig --serve' systemd/cd-proxy.service \
-  || fail "global service template must run pure Zig cd-proxy by default"
+grep -q 'ExecStart=%h/.bun/bin/bun run src/server.ts' systemd/cd-proxy.service \
+  || fail "default service template must run Bun cd-proxy for fastest WebSocket runtime"
 
 grep -q 'scope: "openid email profile offline_access"' src/codex-auth.ts \
   || fail "native Codex OAuth authorization scope changed"
@@ -51,4 +51,4 @@ grep -q 'scope: "openid profile email"' src/codex-auth.ts \
 grep -q '"transport"[[:space:]]*:[[:space:]]*"websocket"' .pi/settings.json \
   || fail "Pi project settings must force websocket transport to disable SSE fallback"
 
-echo "ok: cd-proxy runtime/auth are native; default service is pure Zig; Pi transport forces websocket (no SSE fallback)"
+echo "ok: cd-proxy runtime/auth are native; default service uses Bun for WebSocket speed; Pi transport forces websocket (no SSE fallback)"

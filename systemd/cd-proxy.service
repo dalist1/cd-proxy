@@ -1,5 +1,5 @@
 [Unit]
-Description=cd-proxy minimal Codex OAuth proxy
+Description=cd-proxy native Codex OAuth proxy
 After=network-online.target
 
 [Service]
@@ -8,7 +8,7 @@ WorkingDirectory=%h/cd-proxy
 Environment=CD_PROXY_HOST=127.0.0.1
 Environment=CD_PROXY_PORT=8318
 Environment=CD_PROXY_AUTH_DIR=%h/.local/share/cd-proxy/auths
-ExecStart=%h/cd-proxy/zig-out/bin/cd-proxy-zig --serve
+ExecStart=%h/.bun/bin/bun run src/server.ts
 Restart=on-failure
 RestartSec=2
 

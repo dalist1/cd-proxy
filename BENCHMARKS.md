@@ -14,9 +14,6 @@ Run the local-loop macro benchmark against a mock upstream:
 
 ```bash
 bun run bench:local-loop
-# compare runtimes
-CD_PROXY_BENCH_IMPL=bun bun run bench:local-loop
-CD_PROXY_BENCH_IMPL=zig bun run bench:local-loop
 ```
 
 For a longer run:
@@ -67,26 +64,18 @@ Results:
 
 ## Latest local-loop macro result
 
-Commands:
+Command:
 
 ```bash
-CD_PROXY_BENCH_IMPL=bun CD_PROXY_BENCH_FAST=1 bun run bench:local-loop
-CD_PROXY_BENCH_IMPL=zig CD_PROXY_BENCH_FAST=1 bun run bench:local-loop
+bun run bench:local-loop
 ```
 
-Runtime comparison:
+Bun runtime result:
 
-| Path | Bun fallback | Pure Zig | Change |
-| --- | ---: | ---: | ---: |
-| Proxy `GET /v1/models` avg latency | 0.147 ms | 0.189 ms | Zig 1.29x slower |
-| Proxy `POST /v1/responses` avg latency | 0.319 ms | 0.184 ms | Zig 1.73x faster |
-| Proxy `POST /v1/responses` throughput | 3,137.6 ops/s | 5,444.5 ops/s | Zig 1.74x faster |
-| Proxy WS open + roundtrip avg latency | 0.694 ms | 1.706 ms | Zig 2.46x slower |
-| Proxy WS open + roundtrip throughput | 1,441.6 ops/s | 586.3 ops/s | Zig 0.41x throughput |
+| Path | Avg latency | Throughput |
+| --- | ---: | ---: |
+| Proxy `GET /v1/models` | 0.246 ms | 4,058.8 ops/s |
+| Proxy `POST /v1/responses` | 0.422 ms | 2,372.0 ops/s |
+| Proxy WS open + roundtrip | 0.894 ms | 1,118.5 ops/s |
 
-Measured pure Zig proxy overhead in that run:
-
-- HTTP Responses POST: 0.064 ms/request over direct mock upstream.
-- WebSocket open + one frame: 1.509 ms/request over direct mock upstream.
-
-Takeaway: the pure Zig port already improves the HTTP Responses proxy hot path substantially, while the initial WebSocket bridge prioritizes correctness/parity and still has optimization headroom.
+Takeaway: the default runtime is back on Bun because Bun's evented WebSocket implementation is faster than the old pure Zig WebSocket bridge. Zig remains as a Bun FFI hot-path helper and native auth/HTTP checker.

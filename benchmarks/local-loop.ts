@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const FAST = process.env.CD_PROXY_BENCH_FAST !== "0";
-const IMPL = process.env.CD_PROXY_BENCH_IMPL ?? "zig";
 const MODELS_ITERS = Number(process.env.CD_PROXY_BENCH_MODELS_ITERS ?? (FAST ? "250" : "1000"));
 const POST_ITERS = Number(process.env.CD_PROXY_BENCH_POST_ITERS ?? (FAST ? "250" : "1000"));
 const WS_ITERS = Number(process.env.CD_PROXY_BENCH_WS_OPEN_ITERS ?? (FAST ? "60" : "250"));
@@ -151,11 +150,7 @@ await writeBenchAuth(authDir);
 const mockPort = await freePort();
 const proxyPort = await freePort();
 const mock = await startMockUpstream(mockPort);
-if (IMPL === "zig") {
-  const build = Bun.spawnSync(["zig", "build", "-Doptimize=ReleaseFast", "-p", "zig-out"], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
-  if (!build.success) throw new Error(`zig build failed\n${build.stderr?.toString()}`);
-}
-const proxyCommand = IMPL === "zig" ? ["./zig-out/bin/cd-proxy-zig", "--serve"] : ["bun", "run", "src/server.ts"];
+const proxyCommand = ["bun", "run", "src/server.ts"];
 const proxy = Bun.spawn(proxyCommand, {
   cwd: ROOT,
   stdout: "pipe",
@@ -179,7 +174,7 @@ try {
   const postHeaders = { ...authHeaders, "content-type": "application/json" };
   const body = JSON.stringify({ input: "bench" });
 
-  console.log(`cd-proxy local-loop macro benchmark (${FAST ? "fast" : "full"} feedback loop, impl=${IMPL})`);
+  console.log(`cd-proxy local-loop macro benchmark (${FAST ? "fast" : "full"} feedback loop, impl=bun)`);
   console.log(`iterations: models=${MODELS_ITERS}, post=${POST_ITERS}, ws-open=${WS_ITERS}`);
   console.log(`proxy=http://127.0.0.1:${proxyPort} mock=http://127.0.0.1:${mockPort}\n`);
 
