@@ -21,7 +21,12 @@ const USE_ZIG_PICK = process.env.CD_PROXY_ZIG_PICK === "1" || process.env.CD_PRO
 const MAX_RETRY_CREDENTIALS = Number(process.env.CD_PROXY_MAX_RETRY_CREDENTIALS ?? "0");
 const COOLDOWN_MS = Number(process.env.CD_PROXY_COOLDOWN_MS ?? "30000");
 const REFRESH_SKEW_MS = Number(process.env.CD_PROXY_REFRESH_SKEW_MS ?? String(5 * 60_000));
-const WS_CONNECT_TIMEOUT_MS = Number(process.env.CD_PROXY_WS_CONNECT_TIMEOUT_MS ?? "10000");
+const WS_CONNECT_TIMEOUT_MS = Number(process.env.CD_PROXY_WS_CONNECT_TIMEOUT_MS ?? "30000");
+// Bun defaults: 10s HTTP idle, 120s WebSocket idle. Codex /responses streams (HTTP and WS) routinely exceed
+// both, which surfaces as "stuck" requests and `code 1006` WS closes mid-stream. Bump both, env-overridable.
+const HTTP_IDLE_TIMEOUT_S = Math.max(0, Math.min(255, Number(process.env.CD_PROXY_HTTP_IDLE_TIMEOUT_S ?? "240")));
+const WS_IDLE_TIMEOUT_S = Math.max(0, Math.min(960, Number(process.env.CD_PROXY_WS_IDLE_TIMEOUT_S ?? "600")));
+const WS_MAX_PAYLOAD_BYTES = Number(process.env.CD_PROXY_WS_MAX_PAYLOAD_BYTES ?? String(64 * 1024 * 1024));
 const RETRYABLE_HTTP_STATUSES = parseRetryableHttpStatuses(process.env.CD_PROXY_RETRYABLE_HTTP_STATUSES);
 const MODEL_IDS = (process.env.CD_PROXY_MODELS ?? "gpt-5.3-codex,gpt-5.3-codex-spark,codex-auto-review,gpt-5.5,gpt-5.2")
   .split(",")
@@ -104,6 +109,7 @@ const UNAUTHORIZED_BODY = JSON.stringify({ error: { message: "unauthorized" } },
 const NOT_FOUND_BODY = JSON.stringify({ error: { message: "not found" } }, null, 2);
 const WS_ENDPOINT_NOT_FOUND_BODY = JSON.stringify({ error: { message: "websocket endpoint not found" } }, null, 2);
 const WS_UPGRADE_FAILED_BODY = JSON.stringify({ error: { message: "websocket upgrade failed" } }, null, 2);
+const utf8Decoder = new TextDecoder();
 
 function expandHome(p: string): string {
   return p === "~" ? HOME : p.startsWith("~/") ? HOME + p.slice(1) : p;
@@ -548,8 +554,8 @@ function isTerminalResponseEventPayload(payload: unknown): boolean {
   }
 
   let text: string | undefined;
-  if (payload instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(payload));
-  else if (ArrayBuffer.isView(payload)) text = new TextDecoder().decode(payload as Uint8Array);
+  if (payload instanceof ArrayBuffer) text = utf8Decoder.decode(new Uint8Array(payload));
+  else if (ArrayBuffer.isView(payload)) text = utf8Decoder.decode(payload as Uint8Array);
   if (!text) return false;
   return isTerminalResponseEventText(text);
 }
@@ -563,6 +569,9 @@ async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string
   } catch (err) {
     return { ok: false, status: 502, detail: String(err) };
   }
+  // Deliver upstream binary frames as ArrayBuffer so the message handler can forward them
+  // synchronously without allocating a Blob and awaiting `.arrayBuffer()` per frame.
+  upstream.binaryType = "arraybuffer";
 
   const data: WsProxyData = { upstream, upstreamOpen: false, queue: [], downstreamQueue: [], authLabel: a.label };
   const opened = await new Promise<{ ok: true } | { ok: false; status: number; detail: string }>((resolve) => {
@@ -585,8 +594,8 @@ async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string
       for (const msg of data.queue.splice(0)) upstream.send(msg as any);
       finish({ ok: true });
     });
-    upstream.addEventListener("message", async (event: MessageEvent) => {
-      const payload = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+    upstream.addEventListener("message", (event: MessageEvent) => {
+      const payload = event.data;
       const client = (upstream as any).__client;
       if (client) client.send(payload as any);
       else data.downstreamQueue.push(payload as any);
@@ -785,8 +794,12 @@ setInterval(loadAuths, 60_000).unref();
 Bun.serve({
   host: HOST,
   port: PORT,
+  idleTimeout: HTTP_IDLE_TIMEOUT_S,
   fetch: handle,
   websocket: {
+    idleTimeout: WS_IDLE_TIMEOUT_S,
+    maxPayloadLength: WS_MAX_PAYLOAD_BYTES,
+    sendPings: true,
     open(ws: ServerWebSocket<WsProxyData>) {
       (ws.data.upstream as any).__client = ws;
       for (const msg of ws.data.downstreamQueue.splice(0)) ws.send(msg as any);
