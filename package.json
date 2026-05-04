@@ -5,15 +5,19 @@
   "type": "module",
   "description": "Minimal Codex-only ChatGPT OAuth proxy with round-robin credential rotation.",
   "scripts": {
-    "start": "zig build -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts",
+    "start": "zig build -Doptimize=ReleaseFast -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts",
     "dev": "CD_PROXY_DEBUG=1 bun --watch src/server.ts",
-    "check": "zig build -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts --check",
-    "zig:build": "zig build -p zig-out",
+    "check": "zig build -Doptimize=ReleaseFast -p zig-out >/dev/null 2>&1 || true; bun run src/server.ts --check",
+    "zig:build": "zig build -Doptimize=ReleaseFast -p zig-out",
     "zig:check": "zig build run --",
     "assert:native": "bash scripts/assert-native-implementation.sh",
-    "test": "bun run assert:native && zig build test && bun run scripts/test-native-auth.ts && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts && bun run scripts/test-pi-coding-agent.ts",
+    "test": "bun run assert:native && zig build test && bun run zig:build && bun run scripts/test-native-auth.ts && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts && bun run scripts/test-pi-coding-agent.ts",
     "test:pi-real-ws": "bun run scripts/test-pi-real-websocket.ts",
-    "test:direct-ws": "bun run scripts/test-direct-websocket.ts"
+    "test:direct-ws": "bun run scripts/test-direct-websocket.ts",
+    "bench": "bun run bench:request-response",
+    "bench:request-response": "bun run zig:build && bun run benchmarks/request-response.ts",
+    "bench:local-loop": "bun run zig:build && bun run benchmarks/local-loop.ts",
+    "bench:all": "bun run bench:request-response && bun run bench:local-loop"
   },
   "devDependencies": {
     "@types/bun": "latest"

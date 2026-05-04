@@ -101,16 +101,19 @@ CD_PROXY_MAX_RETRY_CREDENTIALS=5
 CD_PROXY_COOLDOWN_MS=30000
 CD_PROXY_DEBUG=1
 CD_PROXY_MODELS=gpt-5.3-codex,codex-auto-review
+CD_PROXY_ZIG_AUTH_PARSE=0   # opt-in only; benchmark before enabling
+CD_PROXY_ZIG_JWT_EXP=0      # opt-in only; benchmark before enabling
+CD_PROXY_ZIG_PICK=0         # opt-in only for very large auth pools
 ```
 
 ## Zig acceleration
 
 The Zig side now has two pieces:
 
-- `zig-src/core.zig` builds `zig-out/lib/libcd_proxy_core.so`, a tiny native round-robin/skip-scan core used by Bun through `bun:ffi` when present.
+- `zig-src/core.zig` builds `zig-out/lib/libcd_proxy_core.so`, a native hot-path helper used by Bun through `bun:ffi` when present. It handles binary-frame terminal WebSocket event detection without per-frame JS `JSON.parse`; compact text frames use an even faster JS sentinel path. The Zig core also includes opt-in helpers for JWT `exp` decoding, auth-file JSON extraction, and large-pool credential scans.
 - `zig-src/main.zig` builds `zig-out/bin/cd-proxy-zig`, a fast auth-dir checker that prints redacted account prefixes.
 
-`bun run start` and `bun run check` try to build the Zig artifacts first, then gracefully fall back to the TypeScript implementation if Zig is unavailable.
+`bun run start` and `bun run check` try to build ReleaseFast Zig artifacts first, then gracefully fall back to the TypeScript implementation if Zig is unavailable.
 
 ```bash
 zig build test
@@ -118,6 +121,8 @@ zig build -p zig-out
 ./zig-out/bin/cd-proxy-zig
 bun run check   # shows native_implementation: true and zig_core status
 bun run assert:native
+bun run bench              # request/response hot-path microbenchmarks; see BENCHMARKS.md
+bun run bench:local-loop   # local mock-upstream macro benchmark
 ```
 
 Optional override:
