@@ -6,18 +6,25 @@ import { refreshCodexTokens } from "./codex-auth";
 
 const DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex";
 const CHATGPT_CODEX_BASE = (process.env.CD_PROXY_UPSTREAM_BASE ?? DEFAULT_CHATGPT_CODEX_BASE).replace(/\/+$/, "");
-const LEGACY_LOCAL_PROXY_PORT = "8317"; // NATIVE_ASSERT_ALLOW: refused legacy local proxy port only.
+const BLOCKED_LOCAL_PROXY_PORT = "8317"; // NATIVE_ASSERT_ALLOW: refused retired local proxy port only.
 assertNativeUpstreamBase(CHATGPT_CODEX_BASE);
 const HOME = process.env.HOME ?? ".";
 const AUTH_DIR = expandHome(process.env.CD_PROXY_AUTH_DIR ?? "~/.local/share/cd-proxy/auths");
 const API_KEY_FILE = expandHome(process.env.CD_PROXY_API_KEY_FILE ?? "~/.config/cd-proxy/api-key");
 const PORT = Number(process.env.CD_PROXY_PORT ?? "8318");
 const HOST = process.env.CD_PROXY_HOST ?? "127.0.0.1";
-const DEBUG = process.env.CD_PROXY_DEBUG === "1" || process.env.CD_PROXY_DEBUG === "true";
-const EXPOSE_ROTATION_HEADERS = process.env.CD_PROXY_EXPOSE_ROTATION_HEADERS === "1" || process.env.CD_PROXY_EXPOSE_ROTATION_HEADERS === "true";
-const USE_ZIG_AUTH_PARSE = process.env.CD_PROXY_ZIG_AUTH_PARSE === "1" || process.env.CD_PROXY_ZIG_AUTH_PARSE === "true";
-const USE_ZIG_JWT_EXP = process.env.CD_PROXY_ZIG_JWT_EXP === "1" || process.env.CD_PROXY_ZIG_JWT_EXP === "true";
-const USE_ZIG_PICK = process.env.CD_PROXY_ZIG_PICK === "1" || process.env.CD_PROXY_ZIG_PICK === "true";
+const DEBUG = envFlag("CD_PROXY_DEBUG");
+const EXPOSE_ROTATION_HEADERS = envFlag("CD_PROXY_EXPOSE_ROTATION_HEADERS");
+const USE_ZIG_AUTH_PARSE = envFlag("CD_PROXY_ZIG_AUTH_PARSE");
+const USE_ZIG_JWT_EXP = envFlag("CD_PROXY_ZIG_JWT_EXP");
+const USE_ZIG_PICK = envFlag("CD_PROXY_ZIG_PICK");
+const CACHE_AFFINITY_ENABLED = envFlag("CD_PROXY_CACHE_AFFINITY", true);
+const CACHE_AFFINITY_TTL_MS = envNumber("CD_PROXY_CACHE_AFFINITY_TTL_MS", 30 * 60_000);
+const CACHE_AFFINITY_MAX_ENTRIES = envNumber("CD_PROXY_CACHE_AFFINITY_MAX_ENTRIES", 10000);
+const CACHE_AFFINITY_HEADERS = (process.env.CD_PROXY_CACHE_AFFINITY_HEADERS ?? "session_id,x-session-affinity")
+  .split(/[,\s]+/)
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 const MAX_RETRY_CREDENTIALS = Number(process.env.CD_PROXY_MAX_RETRY_CREDENTIALS ?? "0");
 const COOLDOWN_MS = Number(process.env.CD_PROXY_COOLDOWN_MS ?? "30000");
 const REFRESH_SKEW_MS = Number(process.env.CD_PROXY_REFRESH_SKEW_MS ?? String(5 * 60_000));
@@ -71,6 +78,12 @@ interface WsProxyData {
   authLabel: string;
 }
 
+interface CacheAffinityEntry {
+  authPath: string;
+  expiresAt: number;
+  lastUsed: number;
+}
+
 let auths: AuthEntry[] = [];
 let enabledAuthCount = 0;
 let rr = 0;
@@ -81,6 +94,16 @@ const transportStats = {
   responsesWebSocketUpgrades: 0,
   responsesWebSocketUpstreamOpens: 0,
   responsesWebSocketTerminalEvents: 0,
+};
+const cacheAffinity = new Map<string, CacheAffinityEntry>();
+const cacheAffinityStats = {
+  lookups: 0,
+  hits: 0,
+  misses: 0,
+  binds: 0,
+  rebinds: 0,
+  evictions: 0,
+  unavailable: 0,
 };
 let zigCore: undefined | {
   cdproxy_pick_next_u32(len: number, start: number, unavailableMask: number): number;
@@ -115,10 +138,34 @@ function expandHome(p: string): string {
   return p === "~" ? HOME : p.startsWith("~/") ? HOME + p.slice(1) : p;
 }
 
+function envFlag(name: string, defaultValue = false): boolean {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  switch (raw.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false;
+    default:
+      return defaultValue;
+  }
+}
+
+function envNumber(name: string, fallback: number): number {
+  const n = Number(process.env[name] ?? String(fallback));
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function assertNativeUpstreamBase(base: string) {
   const parsed = new URL(base);
   const localHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-  if (localHosts.has(parsed.hostname) && parsed.port === LEGACY_LOCAL_PROXY_PORT) {
+  if (localHosts.has(parsed.hostname) && parsed.port === BLOCKED_LOCAL_PROXY_PORT) {
     throw new Error(
       `Refusing CD_PROXY_UPSTREAM_BASE=${base}. cd-proxy is a native Codex/ChatGPT OAuth implementation and must not wrap another local proxy. ` +
       `Unset CD_PROXY_UPSTREAM_BASE to use ${DEFAULT_CHATGPT_CODEX_BASE}, or point it at a non-production mock only for tests.`,
@@ -250,6 +297,7 @@ async function loadAuths() {
   auths = next;
   enabledAuthCount = auths.reduce((count, a) => count + (a.data.disabled ? 0 : 1), 0);
   if (rr >= auths.length) rr = 0;
+  pruneCacheAffinity();
   log(`loaded ${auths.length} codex auth(s) from ${AUTH_DIR}`);
 }
 
@@ -322,7 +370,10 @@ function isExcluded(exclude: AuthEntry[] | undefined, a: AuthEntry): boolean {
   return !!exclude && exclude.includes(a);
 }
 
-function chooseAuth(exclude?: AuthEntry[]): AuthEntry | undefined {
+function chooseAuth(exclude?: AuthEntry[], affinityKey?: string): AuthEntry | undefined {
+  const affinityAuth = chooseCacheAffinityAuth(affinityKey, exclude);
+  if (affinityAuth) return affinityAuth;
+
   const now = Date.now();
   if (auths.length === 0) return undefined;
 
@@ -353,6 +404,100 @@ function chooseAuth(exclude?: AuthEntry[]): AuthEntry | undefined {
     return a;
   }
   return undefined;
+}
+
+function requestCacheAffinityKey(req: Request): string | undefined {
+  if (!CACHE_AFFINITY_ENABLED || CACHE_AFFINITY_TTL_MS <= 0 || CACHE_AFFINITY_HEADERS.length === 0) return undefined;
+  for (const name of CACHE_AFFINITY_HEADERS) {
+    const raw = req.headers.get(name);
+    const value = raw?.trim();
+    if (!value) continue;
+    // Keep the in-memory key bounded. Pi session IDs are UUID-sized; this mainly
+    // protects custom clients that accidentally send large metadata headers.
+    return `${name}:${value.length > 512 ? value.slice(0, 512) : value}`;
+  }
+  return undefined;
+}
+
+function chooseCacheAffinityAuth(key: string | undefined, exclude?: AuthEntry[]): AuthEntry | undefined {
+  if (!key) return undefined;
+  cacheAffinityStats.lookups++;
+  const now = Date.now();
+  const entry = cacheAffinity.get(key);
+  if (!entry) {
+    cacheAffinityStats.misses++;
+    return undefined;
+  }
+  if (entry.expiresAt <= now) {
+    cacheAffinity.delete(key);
+    cacheAffinityStats.evictions++;
+    cacheAffinityStats.misses++;
+    return undefined;
+  }
+  const a = auths.find((candidate) => candidate.path === entry.authPath);
+  if (!a || a.data.disabled || a.coolingUntil > now || isExcluded(exclude, a)) {
+    cacheAffinityStats.unavailable++;
+    return undefined;
+  }
+  entry.lastUsed = now;
+  entry.expiresAt = now + CACHE_AFFINITY_TTL_MS;
+  cacheAffinityStats.hits++;
+  return a;
+}
+
+function bindCacheAffinity(key: string | undefined, a: AuthEntry) {
+  if (!key || !CACHE_AFFINITY_ENABLED || CACHE_AFFINITY_TTL_MS <= 0 || a.data.disabled) return;
+  const now = Date.now();
+  const previous = cacheAffinity.get(key);
+  if (previous && previous.authPath !== a.path) cacheAffinityStats.rebinds++;
+  else if (!previous) cacheAffinityStats.binds++;
+  cacheAffinity.set(key, {
+    authPath: a.path,
+    expiresAt: now + CACHE_AFFINITY_TTL_MS,
+    lastUsed: now,
+  });
+  pruneCacheAffinity(now);
+}
+
+function pruneCacheAffinity(now = Date.now()) {
+  const validAuthPaths = new Set(auths.map((a) => a.path));
+  for (const [key, entry] of cacheAffinity) {
+    if (entry.expiresAt <= now || !validAuthPaths.has(entry.authPath)) {
+      cacheAffinity.delete(key);
+      cacheAffinityStats.evictions++;
+    }
+  }
+  const maxEntries = Math.max(0, Math.floor(CACHE_AFFINITY_MAX_ENTRIES));
+  if (maxEntries === 0) {
+    cacheAffinityStats.evictions += cacheAffinity.size;
+    cacheAffinity.clear();
+    return;
+  }
+  while (cacheAffinity.size > maxEntries) {
+    let oldestKey: string | undefined;
+    let oldestLastUsed = Infinity;
+    for (const [key, entry] of cacheAffinity) {
+      if (entry.lastUsed < oldestLastUsed) {
+        oldestLastUsed = entry.lastUsed;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) break;
+    cacheAffinity.delete(oldestKey);
+    cacheAffinityStats.evictions++;
+  }
+}
+
+function publicCacheAffinityInfo() {
+  pruneCacheAffinity();
+  return {
+    enabled: CACHE_AFFINITY_ENABLED && CACHE_AFFINITY_TTL_MS > 0,
+    entries: cacheAffinity.size,
+    ttl_ms: CACHE_AFFINITY_TTL_MS,
+    max_entries: Math.max(0, Math.floor(CACHE_AFFINITY_MAX_ENTRIES)),
+    headers: CACHE_AFFINITY_HEADERS,
+    ...cacheAffinityStats,
+  };
 }
 
 async function ensureFresh(a: AuthEntry) {
@@ -630,11 +775,12 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string, pa
   if (unauthorized(req)) return staticJsonResponse(UNAUTHORIZED_BODY, 401);
   if (auths.length === 0) return jsonResponse({ error: { message: `no codex auth files found in ${AUTH_DIR}` } }, { status: 503 });
 
+  const affinityKey = requestCacheAffinityKey(req);
   const tried: AuthEntry[] = [];
   let lastStatus = 0;
   let lastText = "";
   for (let attempt = 0; attempt < maxCredentialAttempts(); attempt++) {
-    const a = chooseAuth(tried);
+    const a = chooseAuth(tried, affinityKey);
     if (!a) break;
     tried.push(a);
 
@@ -670,6 +816,7 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string, pa
       try { connected.data.upstream.close(); } catch {}
       return staticJsonResponse(WS_UPGRADE_FAILED_BODY, 400);
     }
+    bindCacheAffinity(affinityKey, a);
     transportStats.responsesWebSocketUpgrades++;
     return undefined as any;
   }
@@ -679,6 +826,7 @@ async function proxyWebSocketUpgrade(req: Request, server: any, path: string, pa
 
 async function proxyWithRotation(req: Request, path: string, pathname: string): Promise<Response> {
   if (path === "responses" || path === "responses/compact") transportStats.responsesHttpRequests++;
+  const affinityKey = requestCacheAffinityKey(req);
   const tried: AuthEntry[] = [];
   let lastStatus = 0;
   let lastText = "";
@@ -686,7 +834,7 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
   const upstream = upstreamHttpUrlForPath(path);
 
   for (let attempt = 0; attempt < maxCredentialAttempts(); attempt++) {
-    const a = chooseAuth(tried);
+    const a = chooseAuth(tried, affinityKey);
     if (!a) break;
     tried.push(a);
     try {
@@ -712,7 +860,10 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
             // @ts-ignore
             duplex: "half",
           });
-          if (!isRetryableHttpStatus(retry.status)) return withRotationHeaders(retry, a, attempt);
+          if (!isRetryableHttpStatus(retry.status)) {
+            bindCacheAffinity(affinityKey, a);
+            return withRotationHeaders(retry, a, attempt);
+          }
           lastStatus = retry.status;
           lastText = await retry.text().catch(() => "");
         } catch (err) {
@@ -731,6 +882,7 @@ async function proxyWithRotation(req: Request, path: string, pathname: string): 
         continue;
       }
 
+      bindCacheAffinity(affinityKey, a);
       return withRotationHeaders(res, a, attempt);
     } catch (err) {
       lastStatus = 502;
@@ -751,7 +903,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
     return proxyWebSocketUpgrade(req, server, path, pathname);
   }
   if (pathname === "/health" || pathname === "/v1/health") {
-    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, auths: enabledAuthCount, auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore });
+    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, auths: enabledAuthCount, auth_dir: AUTH_DIR, transport_stats: transportStats, cache_affinity: publicCacheAffinityInfo(), zig_core: !!zigCore });
   }
   if (pathname === "/reload" && req.method === "POST") {
     if (unauthorized(req)) return staticJsonResponse(UNAUTHORIZED_BODY, 401);
@@ -760,7 +912,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
   }
   if (unauthorized(req)) return staticJsonResponse(UNAUTHORIZED_BODY, 401);
   if (pathname === "/status" || pathname === "/v1/status") {
-    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, transport_stats: transportStats, zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
+    return jsonResponse({ ok: true, native_implementation: true, upstream_base: CHATGPT_CODEX_BASE, rr_index: rr % Math.max(1, auths.length), auth_dir: AUTH_DIR, transport_stats: transportStats, cache_affinity: publicCacheAffinityInfo(), zig_core: !!zigCore, zig_core_path: ZIG_CORE_PATH, auths: auths.map(publicAuthInfo) });
   }
   if (pathname === "/debug/rotation" || pathname === "/v1/debug/rotation") {
     const count = Math.min(100, Math.max(1, Number(requestSearchParam(req.url, "count") ?? String(auths.length || 1))));

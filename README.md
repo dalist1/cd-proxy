@@ -84,10 +84,11 @@ Round-robin behavior:
 
 1. Loads `codex-*.json` auth files from the cd-proxy auth dir.
 2. Picks the next enabled credential for every HTTP request and WebSocket connection.
-3. Refreshes a credential before use if its expiry is near.
-4. On HTTP `401`, refreshes and retries once before rotating away from that credential.
-5. On retryable HTTP failures (`401,403,408,409,425,429,500,502,503,504` by default), cools that credential and retries the next account inside the same external request instead of surfacing that failure to the client.
-6. For WebSockets, cd-proxy first opens the upstream Codex WebSocket with the selected account; if that handshake fails, it rotates to the next account before upgrading the client connection. Once connected, it freely pipes frames both ways; Codex headers such as `OpenAI-Beta: responses_websockets=2026-02-06`, `x-client-request-id`, `session_id`, and turn-state metadata are preserved.
+3. When cache/session affinity is enabled, requests with the same cache-affinity header (default: `session_id` or `x-session-affinity`) stick to the same credential while the affinity entry is valid, improving upstream prompt-cache hit rates.
+4. Refreshes a credential before use if its expiry is near.
+5. On HTTP `401`, refreshes and retries once before rotating away from that credential.
+6. On retryable HTTP failures (`401,403,408,409,425,429,500,502,503,504` by default), cools that credential and retries the next account inside the same external request instead of surfacing that failure to the client.
+7. For WebSockets, cd-proxy first opens the upstream Codex WebSocket with the selected account; if that handshake fails, it rotates to the next account before upgrading the client connection. Once connected, it freely pipes frames both ways; Codex headers such as `OpenAI-Beta: responses_websockets=2026-02-06`, `x-client-request-id`, `session_id`, and turn-state metadata are preserved.
 
 Useful env vars:
 
@@ -100,6 +101,10 @@ CD_PROXY_API_KEY=override-local-bearer-key
 CD_PROXY_MAX_RETRY_CREDENTIALS=0     # 0/default means try every enabled credential before surfacing failure
 CD_PROXY_COOLDOWN_MS=30000
 CD_PROXY_RETRYABLE_HTTP_STATUSES=401,403,408,409,425,429,500,502,503,504
+CD_PROXY_CACHE_AFFINITY=1                # keep same session/cache header on same credential for better prompt-cache hits
+CD_PROXY_CACHE_AFFINITY_TTL_MS=1800000   # affinity lifetime (default 30 min)
+CD_PROXY_CACHE_AFFINITY_MAX_ENTRIES=10000
+CD_PROXY_CACHE_AFFINITY_HEADERS=session_id,x-session-affinity
 CD_PROXY_WS_CONNECT_TIMEOUT_MS=30000      # how long to wait for the upstream Codex WS handshake before rotating
 CD_PROXY_HTTP_IDLE_TIMEOUT_S=240          # Bun.serve idle timeout (sec, max 255); covers /responses streaming
 CD_PROXY_WS_IDLE_TIMEOUT_S=600            # WebSocket idle timeout (sec, max 960); long Codex turns sit silent
@@ -203,6 +208,7 @@ Run the native auth checks plus the granular rotation suite. The auth check veri
 - `429` cools the failing credential and retries the next credential in the same external request
 - `5xx` upstream failures are retried on the next credential instead of being returned when another account succeeds
 - WebSocket upstream handshake failures rotate to the next credential before the client is upgraded
+- session/cache affinity keeps repeated `session_id` requests on the same credential while new sessions continue round-robin
 - the mock upstream saw the attempted failing credential before the retry
 
 ```bash
@@ -213,6 +219,8 @@ Test OpenAI/Codex Responses WebSocket flow-through against a local mock upstream
 
 ```bash
 ./scripts/test-websocket-flow.ts
+./scripts/test-cache-affinity.ts
+./scripts/test-codex-websocket-cached.ts
 bun run scripts/test-pi-coding-agent.ts
 # or run core tests together
 bun run test

@@ -11,7 +11,7 @@
     "zig:build": "zig build -Doptimize=ReleaseFast -p zig-out",
     "zig:check": "zig build -Doptimize=ReleaseFast -p zig-out && ./zig-out/bin/cd-proxy-zig --check",
     "assert:native": "bash scripts/assert-native-implementation.sh",
-    "test": "bun run assert:native && zig build test && bun run zig:build && bun run scripts/test-native-auth.ts && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts && bun run scripts/test-pi-coding-agent.ts",
+    "test": "bun run assert:native && zig build test && bun run zig:build && bun run scripts/test-native-auth.ts && bun run scripts/granular-round-robin-test.ts && bun run scripts/test-websocket-flow.ts && bun run scripts/test-cache-affinity.ts && bun run scripts/test-codex-websocket-cached.ts && bun run scripts/test-pi-coding-agent.ts",
     "test:pi-real-ws": "bun run scripts/test-pi-real-websocket.ts",
     "test:direct-ws": "bun run scripts/test-direct-websocket.ts",
     "bench": "bun run bench:request-response",

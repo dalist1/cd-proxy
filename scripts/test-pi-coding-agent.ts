@@ -180,7 +180,7 @@ try {
     env: {
       ...process.env,
       PI_CODING_AGENT_DIR: piDir,
-      PI_PACKAGE_DIR: `${process.env.HOME ?? ""}/.bun/install/global/node_modules/@mariozechner/pi-coding-agent`,
+      PI_PACKAGE_DIR: `${process.env.HOME ?? ""}/.bun/install/global/node_modules/@earendil-works/pi-coding-agent`,
       PI_SKIP_VERSION_CHECK: "1",
       PI_NO_PROXY_AUTO_START: "1",
       OPENAI_API_KEY: "",
