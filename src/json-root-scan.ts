@@ -18,24 +18,6 @@ function skipJsonWhitespace(bytes: Uint8Array, idx: number): number {
 
 type JsonStringSpan = { start: number; end: number; next: number; escaped: boolean };
 
-function parseJsonStringSpan(bytes: Uint8Array, idx: number): JsonStringSpan | undefined {
-  if (idx >= bytes.byteLength || bytes[idx] !== 0x22) return undefined;
-  let i = idx + 1;
-  const start = i;
-  let escaped = false;
-  while (i < bytes.byteLength) {
-    const c = bytes[i];
-    if (c === 0x22) return { start, end: i, next: i + 1, escaped };
-    if (c === 0x5c) {
-      escaped = true;
-      i += 2;
-      continue;
-    }
-    i++;
-  }
-  return undefined;
-}
-
 function quoteIsEscaped(bytes: Uint8Array, quote: number): boolean {
   let slashes = 0;
   for (let i = quote - 1; i >= 0 && bytes[i] === 0x5c; i--) slashes++;
@@ -73,64 +55,6 @@ function decodeJsonStringSpan(bytes: Uint8Array, span: JsonStringSpan): string |
   } catch {
     return undefined;
   }
-}
-
-function skipJsonValueBytes(bytes: Uint8Array, idx: number, depth = 0): number {
-  if (depth > 128) return -1;
-  idx = skipJsonWhitespace(bytes, idx);
-  if (idx >= bytes.byteLength) return -1;
-  const c = bytes[idx];
-
-  if (c === 0x22) {
-    const span = parseJsonStringSpan(bytes, idx);
-    return span ? span.next : -1;
-  }
-
-  if (c === 0x7b) {
-    idx = skipJsonWhitespace(bytes, idx + 1);
-    if (bytes[idx] === 0x7d) return idx + 1;
-    while (idx < bytes.byteLength) {
-      const key = parseJsonStringSpan(bytes, idx);
-      if (!key) return -1;
-      idx = skipJsonWhitespace(bytes, key.next);
-      if (bytes[idx] !== 0x3a) return -1;
-      idx = skipJsonValueBytes(bytes, idx + 1, depth + 1);
-      if (idx < 0) return -1;
-      idx = skipJsonWhitespace(bytes, idx);
-      if (bytes[idx] === 0x2c) {
-        idx = skipJsonWhitespace(bytes, idx + 1);
-        continue;
-      }
-      if (bytes[idx] === 0x7d) return idx + 1;
-      return -1;
-    }
-    return -1;
-  }
-
-  if (c === 0x5b) {
-    idx = skipJsonWhitespace(bytes, idx + 1);
-    if (bytes[idx] === 0x5d) return idx + 1;
-    while (idx < bytes.byteLength) {
-      idx = skipJsonValueBytes(bytes, idx, depth + 1);
-      if (idx < 0) return -1;
-      idx = skipJsonWhitespace(bytes, idx);
-      if (bytes[idx] === 0x2c) {
-        idx = skipJsonWhitespace(bytes, idx + 1);
-        continue;
-      }
-      if (bytes[idx] === 0x5d) return idx + 1;
-      return -1;
-    }
-    return -1;
-  }
-
-  const start = idx;
-  while (idx < bytes.byteLength) {
-    const ch = bytes[idx];
-    if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x0a || ch === 0x0d || ch === 0x09) break;
-    idx++;
-  }
-  return idx > start ? idx : -1;
 }
 
 export function jsonRootStringFieldValue(bytes: Uint8Array, fields: Set<string>): string | undefined {

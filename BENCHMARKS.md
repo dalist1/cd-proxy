@@ -9,6 +9,7 @@ bun run bench
 bun run bench:request-response
 bun run bench:proxy-hot-path
 bun run bench:stage-profile
+bun run bench:ws-throughput
 bun run bench:local-loop
 ```
 
@@ -18,6 +19,7 @@ Full feedback loop:
 CD_PROXY_BENCH_FAST=0 bun run bench:request-response
 CD_PROXY_BENCH_FAST=0 bun run bench:proxy-hot-path
 CD_PROXY_BENCH_FAST=0 bun run bench:stage-profile
+CD_PROXY_BENCH_FAST=0 bun run bench:ws-throughput
 CD_PROXY_BENCH_FAST=0 bun run bench:local-loop
 ```
 
@@ -38,6 +40,7 @@ For the divide-and-conquer optimization plan, see [`docs/performance-plan.md`](.
 | Synthetic micro | `benchmarks/request-response.ts` | Fast pathname/route/model/WS terminal checks. |
 | Runtime hot path | `benchmarks/proxy-hot-path.ts` | Actual modular helpers: headers, affinity scanner, affinity map, auth pick, debug no-op. |
 | Stage profile | `benchmarks/stage-profile.ts` | `CD_PROXY_PROFILE=1` per-stage timing for HTTP, WS open, and persistent WS frames. |
+| Persistent WS throughput | `benchmarks/ws-throughput.ts` | Direct vs proxied frame throughput on one reused WebSocket. |
 | Macro local loop | `benchmarks/local-loop.ts` | End-to-end cd-proxy overhead against a local mock upstream. |
 
 ## Latest request/response micro result
@@ -58,13 +61,13 @@ Results:
 
 | Hot path | Baseline | Optimized | Gain |
 |---|---:|---:|---:|
-| Request pathname extraction | 687,880 ops/s | 8,164,885 ops/s | 11.87x faster |
-| Request route resolution | 798,794 ops/s | 6,162,174 ops/s | 7.71x faster |
-| Models response body generation | 181,114 ops/s | 94,168,032 ops/s | 519.94x faster |
-| WebSocket upgrade header check | 9,489,668 ops/s | 12,789,230 ops/s | 1.35x faster |
-| WebSocket upstream header forwarding | 185,597 ops/s | 283,546 ops/s | 1.53x faster |
-| Responses WS terminal event, text | 847,585 ops/s | 71,221,317 ops/s | 84.03x faster |
-| Responses WS terminal event, binary | 893,545 ops/s | 1,180,622 ops/s | 1.32x faster |
+| Request pathname extraction | 1,103,444 ops/s | 10,059,204 ops/s | 9.12x faster |
+| Request route resolution | 1,277,029 ops/s | 7,781,028 ops/s | 6.09x faster |
+| Models response body generation | 243,403 ops/s | 83,314,032 ops/s | 342.29x faster |
+| WebSocket upgrade header check | 12,806,403 ops/s | 17,778,744 ops/s | 1.39x faster |
+| WebSocket upstream header forwarding | 318,265 ops/s | 409,212 ops/s | 1.29x faster |
+| Responses WS terminal event, text | 1,323,809 ops/s | 110,896,366 ops/s | 83.77x faster |
+| Responses WS terminal event, binary | 1,351,947 ops/s | 1,700,132 ops/s | 1.26x faster |
 
 ## Latest runtime hot-path result
 
@@ -99,10 +102,29 @@ Findings:
 
 | Path | Dominant stages |
 |---|---|
-| HTTP with header affinity | `http.fetch` averaged 0.344 ms of 0.427 ms total; network/upstream hop dominates. |
-| HTTP with body affinity | `http.fetch` averaged 0.290 ms; `http.affinity_body` averaged 0.041 ms for a 4KiB prompt body. |
-| WS open + one frame | `ws.upstream_open_wait` averaged 0.235 ms, `ws.client_upgrade` 0.136 ms, `ws.upstream_ctor` 0.079 ms; double handshake dominates. |
-| Persistent WS frame loop | per-frame send and upstream-message forwarding were ~0.01 ms each; handshake cost is amortized. |
+| HTTP with header affinity | `http.fetch` averaged 1.063 ms of 1.256 ms total; network/upstream hop dominates. |
+| HTTP with body affinity | `http.fetch` averaged 0.735 ms; `http.affinity_body` averaged 0.083 ms for a 4KiB prompt body. |
+| WS open + one frame | `ws.upstream_open_wait` averaged 0.589 ms, `ws.client_upgrade` 0.204 ms, `ws.upstream_ctor` 0.145 ms; double handshake dominates. |
+| Persistent WS frame loop | per-frame send and upstream-message forwarding were ~0.015 ms each; handshake cost is amortized. |
+
+## Latest persistent WebSocket throughput result
+
+Command:
+
+```bash
+bun run bench:ws-throughput
+```
+
+This benchmark isolates Pi `websocket-cached`-style reuse by sending many frames over one direct WS and one proxied WS.
+
+| Path | Avg latency | Throughput |
+|---|---:|---:|
+| Direct terminal frames | 0.0363 ms | 27,510.8 frames/s |
+| Proxy terminal frames | 0.2365 ms | 4,228.6 frames/s |
+| Direct non-terminal frames | 0.0285 ms | 35,132.2 frames/s |
+| Proxy non-terminal frames | 0.1526 ms | 6,554.3 frames/s |
+
+Takeaway: once a WebSocket is persistent, proxy frame overhead is roughly 0.12-0.20 ms/frame locally in this run; optimizing or amortizing handshakes remains more important than terminal detection.
 
 ## Latest local-loop macro result
 

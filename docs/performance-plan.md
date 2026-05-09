@@ -51,6 +51,7 @@ bun run test
 | Synthetic micro | `benchmarks/request-response.ts` | Route parsing, models body, WS header checks, terminal event detection. |
 | Runtime hot path | `benchmarks/proxy-hot-path.ts` | Actual helpers: headers, affinity scanner/map, auth pick, debug no-op. |
 | Stage profile | `benchmarks/stage-profile.ts` | Runs with `CD_PROXY_PROFILE=1` and prints exact per-stage timings. |
+| Persistent WS throughput | `benchmarks/ws-throughput.ts` | Direct vs proxied frame throughput on one reused WebSocket. |
 | Macro local loop | `benchmarks/local-loop.ts` | End-to-end proxy overhead against a local mock upstream. |
 
 ## 4. Latest fast-loop baseline
@@ -59,13 +60,13 @@ bun run test
 
 | Path | Result |
 |---|---:|
-| Request pathname extraction | 8,164,885 ops/s |
-| Request route resolution | 6,162,174 ops/s |
-| Cached models body | 94,168,032 ops/s |
-| WS upgrade header check | 12,789,230 ops/s |
-| WS upstream header forwarding | 283,546 ops/s |
-| WS terminal event, text | 71,221,317 ops/s |
-| WS terminal event, binary Zig helper | 1,180,622 ops/s |
+| Request pathname extraction | 10,059,204 ops/s |
+| Request route resolution | 7,781,028 ops/s |
+| Cached models body | 83,314,032 ops/s |
+| WS upgrade header check | 17,778,744 ops/s |
+| WS upstream header forwarding | 409,212 ops/s |
+| WS terminal event, text | 110,896,366 ops/s |
+| WS terminal event, binary Zig helper | 1,700,132 ops/s |
 
 ### 4.2 `bench:proxy-hot-path`
 
@@ -84,10 +85,10 @@ bun run test
 
 | Flow | Primary bottleneck | Persistent fix / posture |
 |---|---|---|
-| HTTP with `session_id` header affinity | `http.fetch` ~0.344 ms of ~0.427 ms. | Keep header affinity; upstream/network hop dominates. |
-| HTTP body-only affinity | `http.fetch` dominates; body scan ~0.041 ms for 4KiB body. | Prefer `session_id` header; keep scanner fallback. |
+| HTTP with `session_id` header affinity | `http.fetch` ~1.063 ms of ~1.256 ms. | Keep header affinity; upstream/network hop dominates. |
+| HTTP body-only affinity | `http.fetch` dominates; body scan ~0.083 ms for 4KiB body. | Prefer `session_id` header; keep scanner fallback. |
 | WS open + one frame | upstream open wait, client upgrade, upstream ctor dominate. | Use Pi `websocket-cached` to amortize handshakes. |
-| Persistent WS frames | send/forward ~0.01 ms each; terminal detection tiny. | Focus on persistent sessions and avoid per-frame optional work. |
+| Persistent WS frames | send/forward ~0.015 ms each; terminal detection tiny. | Focus on persistent sessions and avoid per-frame optional work. |
 | Debug capture disabled | effectively free. | Keep disabled by default; bounded async when enabled. |
 
 ### 4.4 `bench:local-loop`
@@ -256,11 +257,11 @@ Persistent fix: keep disabled by default, bounded and async when enabled.
 
 ### Phase A: persistent WebSocket throughput
 
-1. Open one direct mock WS and one proxied WS.
-2. Send N frames on each.
-3. Compare per-frame latency.
-4. Repeat with terminal and non-terminal frames.
-5. Repeat with debug capture enabled.
+1. Keep `benchmarks/ws-throughput.ts` in the regular benchmark loop.
+2. Track terminal and non-terminal frame overhead separately.
+3. Current local proxy overhead is roughly 0.12-0.20 ms/frame on a reused WS.
+4. Add a debug-capture-enabled variant.
+5. Add binary-frame variant if upstream starts sending binary frames often.
 
 Why: this reflects Pi `websocket-cached`, where handshake cost is amortized.
 
