@@ -22,7 +22,7 @@ Checked against the installed Pi code, not only docs:
 | `@earendil-works/pi-agent-core/dist/agent.js` | Agent forwards `sessionId`, `transport`, `thinkingBudgets`, `maxRetryDelayMs`, and resolved API key into provider stream calls. |
 | `@earendil-works/pi-ai/dist/types.d.ts` | `Transport = "sse" | "websocket" | "websocket-cached" | "auto"`; `CacheRetention = "none" | "short" | "long"`. |
 | `@earendil-works/pi-ai/dist/providers/openai-codex-responses.js` | Codex WS cache uses a per-session WebSocket map, 5-minute idle expiry, continuation state, and `previous_response_id` deltas. |
-| `src/server.ts` | cd-proxy forwards app headers/body fields, rotates credentials, keeps cache-affinity sessions sticky to one credential, and does not cache model responses or request bodies. |
+| `src/server.ts` | cd-proxy forwards app headers/body fields, rotates credentials, keeps cache-affinity sessions sticky to one credential, byte-scans root JSON cache fields without `JSON.parse`, and does not cache model responses or request bodies. |
 
 Local code tests added:
 
@@ -34,7 +34,8 @@ bun run scripts/test-codex-websocket-cached.ts
 They verify:
 
 - cd-proxy keeps repeated `session_id` requests on the same upstream credential while new sessions continue round-robin.
-- two `openai-codex-responses` calls with the same `sessionId` and `transport: "websocket-cached"` produce a second WS `response.create` frame with `previous_response_id` and delta-sized `input`.
+- cd-proxy also keeps repeated body-only `prompt_cache_key` requests on the same credential without parsing full request JSON.
+- two `openai-codex-responses` calls through cd-proxy with the same `sessionId` and `transport: "websocket-cached"` produce a second WS `response.create` frame with `previous_response_id` and delta-sized `input` over one proxied WebSocket.
 
 ## Pi cache params
 
@@ -229,8 +230,10 @@ What it does cache/keep in memory:
 | Auth files | Loaded on startup, reloaded every 60s, and via `POST /reload`. |
 | Token refresh | `refreshInFlight` deduplicates concurrent refreshes for one credential. |
 | Credential cooldown | Failed credentials stay cooled until `coolingUntil`. |
+| Cache-affinity map | Bounded in-memory session/cache-key to credential bindings; LRU-ordered for O(1) hot-path eviction. |
 | Model list body | `/models` JSON is prebuilt from `CD_PROXY_MODELS`. |
 | Zig core handle | Loaded once if present. |
+| Debug request capture | Disabled by default; when `CD_PROXY_DEBUG_SAVE_REQUESTS=1`, request snapshots with sensitive headers redacted are queued to disk asynchronously and bounded by `CD_PROXY_DEBUG_SAVE_MAX_PENDING`. |
 
 cd-proxy forwards Pi cache headers/body fields upstream unchanged unless they are hop-by-hop transport headers. It also uses cache/session affinity to avoid defeating account-scoped upstream prompt caches when multiple credentials are configured.
 
@@ -241,8 +244,8 @@ Header/body behavior from `src/server.ts`:
 | HTTP/SSE | Deletes `host`, `connection`, `content-length`; replaces `Authorization` with selected upstream Codex token; preserves request body fields such as `prompt_cache_key`, `previous_response_id`, `input`, `store`. |
 | HTTP/SSE | Sets `Content-Type` to incoming value or `application/json`; sets `Accept: text/event-stream` for non-GET requests if absent. |
 | HTTP/SSE | Adds `ChatGPT-Account-ID` from selected credential when present. |
-| WebSocket | Opens upstream WS before client upgrade; deletes hop-by-hop WS headers; preserves app headers such as `OpenAI-Beta`, `x-client-request-id`, `session_id`. |
-| WebSocket | Replaces `Authorization` and adds `ChatGPT-Account-ID` for the selected upstream credential. |
+| WebSocket | Opens upstream WS before client upgrade; deletes hop-by-hop WS headers; preserves app headers such as `OpenAI-Beta`, `x-client-request-id`, `session_id`. It also replaces client `Authorization`/`ChatGPT-Account-ID` so upstream only sees the selected cd-proxy credential. |
+| WebSocket | Replaces `Authorization` and adds `ChatGPT-Account-ID` for the selected upstream credential; when no header affinity already bound the socket, the first client `response.create` frame is byte-scanned for `prompt_cache_key` to bind future affinity without blocking frame forwarding. |
 
 Implication: cache affinity is controlled by Pi/provider fields, not by cd-proxy. cd-proxy only changes auth/account routing.
 
@@ -253,6 +256,7 @@ Provider-side prompt caches are usually account/session scoped. cd-proxy now kee
 - Affinity is enabled by default with `CD_PROXY_CACHE_AFFINITY=1`.
 - Default affinity headers are `session_id` and `x-session-affinity`.
 - The first request for a cache/session key chooses the normal round-robin credential and binds that key to the credential.
+- Affinity keys are normalized from header values or body `prompt_cache_key`/`session_id` values, so the same session value maps to one credential even when it appears through different supported fields.
 - Later requests with the same key prefer the bound credential while it is enabled, not cooling down, and the affinity entry has not expired.
 - New sessions still continue the normal round-robin sequence.
 - If the bound credential fails/cools down, cd-proxy retries other credentials and rebinds the session on success.
@@ -274,6 +278,8 @@ Provider-side prompt caches are usually account/session scoped. cd-proxy now kee
 | `CD_PROXY_CACHE_AFFINITY_TTL_MS` | Affinity entry lifetime; default 30 minutes. |
 | `CD_PROXY_CACHE_AFFINITY_MAX_ENTRIES` | Bounds in-memory affinity map; default 10000. |
 | `CD_PROXY_CACHE_AFFINITY_HEADERS` | Comma/space list of headers used as affinity keys; default `session_id,x-session-affinity`. |
+| `CD_PROXY_CACHE_AFFINITY_BODY_FIELDS` | Comma/space list of root JSON string fields byte-scanned for affinity when useful; default `prompt_cache_key,session_id`. |
+| `CD_PROXY_CACHE_AFFINITY_MAX_VALUE_BYTES` | Bounds any normalized affinity value; default `512`. |
 | `CD_PROXY_MODELS` | Model IDs advertised; does not cache model capabilities. |
 | `CD_PROXY_ZIG_AUTH_PARSE` | Optional auth-file parse fast path. |
 | `CD_PROXY_ZIG_JWT_EXP` | Optional JWT expiry parse fast path. |

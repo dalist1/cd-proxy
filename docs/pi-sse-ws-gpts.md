@@ -10,12 +10,12 @@
 { "transport": "websocket" }
 ```
 
-Use `"websocket"` for this repo. It disables Pi's `auto` SSE fallback.
+Use `"websocket"` for deterministic WS-only tests. Use `"websocket-cached"` after validation when you want Pi's reusable Codex WebSocket plus `previous_response_id` delta mode.
 
 ## Speed notes
 
 - **WebSocket is fastest for Codex/GPT agent turns**: one upgrade, bidirectional frames, less stream parsing, lower latency for tool/event traffic.
-- **`websocket-cached` can be fastest for repeated Codex turns**: Pi may reuse the WS and send `previous_response_id` deltas.
+- **`websocket-cached` can be fastest for repeated Codex turns**: Pi may reuse the WS and send `previous_response_id` deltas. cd-proxy keeps that client WebSocket attached to one upstream WebSocket and forwards delta frames unchanged.
 - **SSE is simpler and widely compatible**: one HTTP stream per response, good fallback, usually a little more overhead.
 - cd-proxy keeps the fast path in **Bun** for WebSockets; Zig only helps hot-path parsing/selection.
 

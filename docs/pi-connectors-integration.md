@@ -198,6 +198,8 @@ Optional debug response headers when `CD_PROXY_EXPOSE_ROTATION_HEADERS=1`:
 | `CD_PROXY_CACHE_AFFINITY_TTL_MS` | `1800000` | Cache-affinity binding lifetime. |
 | `CD_PROXY_CACHE_AFFINITY_MAX_ENTRIES` | `10000` | Max in-memory affinity bindings. |
 | `CD_PROXY_CACHE_AFFINITY_HEADERS` | `session_id,x-session-affinity` | Headers used as affinity keys. |
+| `CD_PROXY_CACHE_AFFINITY_BODY_FIELDS` | `prompt_cache_key,session_id` | Root JSON string fields byte-scanned for affinity when headers are absent or request-body cache keys are more direct. |
+| `CD_PROXY_CACHE_AFFINITY_MAX_VALUE_BYTES` | `512` | Bounds normalized cache-affinity values. |
 | `CD_PROXY_REFRESH_SKEW_MS` | `300000` | Refresh before token expiry. |
 | `CD_PROXY_WS_CONNECT_TIMEOUT_MS` | `30000` | WS upstream handshake timeout before rotating. |
 | `CD_PROXY_HTTP_IDLE_TIMEOUT_S` | `240` | Long SSE/HTTP turns. Bun max clamped to 255. |
@@ -205,12 +207,16 @@ Optional debug response headers when `CD_PROXY_EXPOSE_ROTATION_HEADERS=1`:
 | `CD_PROXY_WS_MAX_PAYLOAD_BYTES` | `67108864` | Max single WS frame. |
 | `CD_PROXY_EXPOSE_ROTATION_HEADERS` | `0` | Integration debugging only. |
 | `CD_PROXY_DEBUG` | `0` | Verbose logs. |
+| `CD_PROXY_DEBUG_SAVE_REQUESTS` | `0` | Save proxied HTTP requests and WebSocket client frames asynchronously for debugging; sensitive headers are redacted. |
+| `CD_PROXY_DEBUG_SAVE_DIR` | `~/.local/share/cd-proxy/debug-requests` | Directory for debug request snapshots. |
+| `CD_PROXY_DEBUG_SAVE_BODY_BYTES` | `1048576` | Per-request/body bytes saved before truncation. |
+| `CD_PROXY_DEBUG_SAVE_MAX_PENDING` | `1024` | Max queued debug snapshot writes before dropping. |
 | `CD_PROXY_ZIG_CORE` | `zig-out/lib/libcd_proxy_core.*` | Override Zig helper path. |
 | `CD_PROXY_ZIG_AUTH_PARSE` | `0` | Opt-in auth JSON parser. Benchmark first. |
 | `CD_PROXY_ZIG_JWT_EXP` | `0` | Opt-in JWT exp decoder. Benchmark first. |
 | `CD_PROXY_ZIG_PICK` | `0` | Opt-in large-pool credential picker. |
 
-Speed-sensitive knobs: `transport=websocket` or `transport=websocket-cached`, `CD_PROXY_CACHE_AFFINITY=1`, `CD_PROXY_WS_IDLE_TIMEOUT_S`, `CD_PROXY_WS_CONNECT_TIMEOUT_MS`, `CD_PROXY_WS_MAX_PAYLOAD_BYTES`, and keeping Bun as the runtime.
+Speed-sensitive knobs: `transport=websocket` or `transport=websocket-cached`, `CD_PROXY_CACHE_AFFINITY=1`, `CD_PROXY_CACHE_AFFINITY_BODY_FIELDS`, `CD_PROXY_WS_IDLE_TIMEOUT_S`, `CD_PROXY_WS_CONNECT_TIMEOUT_MS`, `CD_PROXY_WS_MAX_PAYLOAD_BYTES`, and keeping Bun as the runtime. Debug request capture is off by default and writes asynchronously when enabled.
 
 ## Credential file params
 
