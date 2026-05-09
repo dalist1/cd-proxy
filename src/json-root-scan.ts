@@ -36,6 +36,27 @@ function parseJsonStringSpan(bytes: Uint8Array, idx: number): JsonStringSpan | u
   return undefined;
 }
 
+function quoteIsEscaped(bytes: Uint8Array, quote: number): boolean {
+  let slashes = 0;
+  for (let i = quote - 1; i >= 0 && bytes[i] === 0x5c; i--) slashes++;
+  return (slashes & 1) === 1;
+}
+
+function parseJsonStringSpanFast(bytes: Uint8Array, haystack: Buffer, idx: number): JsonStringSpan | undefined {
+  if (idx >= bytes.byteLength || bytes[idx] !== 0x22) return undefined;
+  const start = idx + 1;
+  let searchFrom = start;
+  let escaped = false;
+  while (searchFrom < bytes.byteLength) {
+    const quote = haystack.indexOf(0x22, searchFrom);
+    if (quote < 0) return undefined;
+    if (!quoteIsEscaped(bytes, quote)) return { start, end: quote, next: quote + 1, escaped };
+    escaped = true;
+    searchFrom = quote + 1;
+  }
+  return undefined;
+}
+
 function asciiSpanEquals(bytes: Uint8Array, span: JsonStringSpan, value: string): boolean {
   if (span.escaped || span.end - span.start !== value.length) return false;
   for (let i = 0; i < value.length; i++) {
@@ -113,36 +134,40 @@ function skipJsonValueBytes(bytes: Uint8Array, idx: number, depth = 0): number {
 }
 
 export function jsonRootStringFieldValue(bytes: Uint8Array, fields: Set<string>): string | undefined {
-  let idx = skipJsonWhitespace(bytes, 0);
-  if (idx >= bytes.byteLength || bytes[idx] !== 0x7b) return undefined;
-  idx = skipJsonWhitespace(bytes, idx + 1);
-  if (bytes[idx] === 0x7d) return undefined;
+  // Single-pass root-key scanner. It validates only enough JSON structure to
+  // stay at object depth 1 and avoids recursively skipping large `input` arrays.
+  const haystack = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let depth = 0;
+  for (let idx = 0; idx < bytes.byteLength; idx++) {
+    const c = bytes[idx];
+    if (c === 0x7b || c === 0x5b) { // { or [
+      depth++;
+      continue;
+    }
+    if (c === 0x7d || c === 0x5d) { // } or ]
+      depth--;
+      if (depth < 0) return undefined;
+      continue;
+    }
+    if (c !== 0x22) continue;
 
-  while (idx < bytes.byteLength) {
-    const key = parseJsonStringSpan(bytes, idx);
+    const key = parseJsonStringSpanFast(bytes, haystack, idx);
     if (!key) return undefined;
-    idx = skipJsonWhitespace(bytes, key.next);
-    if (bytes[idx] !== 0x3a) return undefined;
-    idx = skipJsonWhitespace(bytes, idx + 1);
+    idx = key.next - 1;
+    if (depth !== 1) continue;
+
+    let next = skipJsonWhitespace(bytes, key.next);
+    if (bytes[next] !== 0x3a) continue;
+    next = skipJsonWhitespace(bytes, next + 1);
 
     for (const field of fields) {
       if (asciiSpanEquals(bytes, key, field)) {
-        const value = parseJsonStringSpan(bytes, idx);
+        const value = parseJsonStringSpanFast(bytes, haystack, next);
         const decoded = value ? decodeJsonStringSpan(bytes, value) : undefined;
         if (decoded?.trim()) return decoded;
         break;
       }
     }
-
-    idx = skipJsonValueBytes(bytes, idx);
-    if (idx < 0) return undefined;
-    idx = skipJsonWhitespace(bytes, idx);
-    if (bytes[idx] === 0x2c) {
-      idx = skipJsonWhitespace(bytes, idx + 1);
-      continue;
-    }
-    if (bytes[idx] === 0x7d) return undefined;
-    return undefined;
   }
   return undefined;
 }

@@ -16,8 +16,9 @@
     "test:direct-ws": "bun run scripts/test-direct-websocket.ts",
     "bench": "bun run bench:request-response",
     "bench:request-response": "bun run zig:build && bun run benchmarks/request-response.ts",
+    "bench:proxy-hot-path": "bun run benchmarks/proxy-hot-path.ts",
     "bench:local-loop": "bun run zig:build && bun run benchmarks/local-loop.ts",
-    "bench:all": "bun run bench:request-response && bun run bench:local-loop"
+    "bench:all": "bun run bench:request-response && bun run bench:proxy-hot-path && bun run bench:local-loop"
   },
   "devDependencies": {
     "@types/bun": "latest"

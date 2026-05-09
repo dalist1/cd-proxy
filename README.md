@@ -127,6 +127,8 @@ CD_PROXY_ZIG_PICK=0         # opt-in only for very large auth pools
 
 For a granular end-to-end breakdown of startup, routing, HTTP/SSE proxying, WebSocket proxying, Pi `websocket-cached`, cache affinity, debug capture, retries, and stats, see [`docs/message-flow.md`](./docs/message-flow.md).
 
+For the divide-and-conquer speed plan and benchmark matrix, see [`docs/performance-plan.md`](./docs/performance-plan.md).
+
 ## Source layout
 
 Runtime code is split by hot-path responsibility:

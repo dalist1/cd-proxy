@@ -101,11 +101,12 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
   return jsonResponse({ error: { message: "all codex credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
 }
 
-function buildHeaders(req: Request, a: AuthEntry): Headers {
+export function buildHeaders(req: Request, a: AuthEntry): Headers {
   const h = new Headers(req.headers);
   h.delete("host");
   h.delete("connection");
   h.delete("content-length");
+  h.delete("chatgpt-account-id");
   h.set("authorization", `Bearer ${a.data.access_token}`);
   h.set("content-type", req.headers.get("content-type") ?? "application/json");
   if (a.data.account_id) h.set("ChatGPT-Account-ID", a.data.account_id);
