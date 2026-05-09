@@ -113,6 +113,7 @@ CD_PROXY_HTTP_IDLE_TIMEOUT_S=240          # Bun.serve idle timeout (sec, max 255
 CD_PROXY_WS_IDLE_TIMEOUT_S=600            # WebSocket idle timeout (sec, max 960); long Codex turns sit silent
 CD_PROXY_WS_MAX_PAYLOAD_BYTES=67108864    # max single frame from upstream / client (default 64 MiB)
 CD_PROXY_DEBUG=1
+CD_PROXY_PROFILE=0                        # set 1 for per-stage profile timings in /health and /status
 CD_PROXY_DEBUG_SAVE_REQUESTS=0            # set 1 to save proxied HTTP requests + WS client frames to disk (sensitive headers redacted)
 CD_PROXY_DEBUG_SAVE_DIR=~/.local/share/cd-proxy/debug-requests
 CD_PROXY_DEBUG_SAVE_BODY_BYTES=1048576
@@ -139,6 +140,7 @@ Runtime code is split by hot-path responsibility:
 - `src/websocket-proxy.ts`: WebSocket handshake/failover/frame forwarding.
 - `src/cache-affinity.ts`: bounded session/cache-key-to-credential affinity.
 - `src/debug-capture.ts`: optional async request capture.
+- `src/profiler.ts`: optional per-stage timings for benchmark/debug runs.
 - `src/json-root-scan.ts`: low-level JSON root-field scanner used by affinity/debug paths.
 - `src/config.ts`, `src/native-core.ts`, `src/types.ts`: env/config, Zig FFI loading, shared types.
 

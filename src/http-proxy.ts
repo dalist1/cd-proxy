@@ -2,6 +2,7 @@ import type { AuthEntry, TransportStats } from "./types";
 import { AuthStore } from "./auth-store";
 import { CacheAffinityStore } from "./cache-affinity";
 import { DebugRequestCapture } from "./debug-capture";
+import { Profiler } from "./profiler";
 
 const JSON_HEADERS = { "content-type": "application/json" } as const;
 
@@ -14,6 +15,7 @@ interface HttpProxyOptions {
   upstreamResponsesCompactUrl: string;
   retryableHttpStatuses: Set<number>;
   cooldownMs: number;
+  profiler: Profiler;
   log: (...args: unknown[]) => void;
 }
 
@@ -42,23 +44,49 @@ export function withRotationHeaders(res: Response, a: AuthEntry, attempt: number
 }
 
 export async function proxyWithRotation(req: Request, path: string, pathname: string, opts: HttpProxyOptions, exposeHeaders: boolean, home: string): Promise<Response> {
+  const totalStart = opts.profiler.now();
   if (path === "responses" || path === "responses/compact") opts.transportStats.responsesHttpRequests++;
   const tried: AuthEntry[] = [];
   let lastStatus = 0;
   let lastText = "";
+
+  let stageStart = opts.profiler.now();
   const requestBody = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();
-  const affinityKey = opts.cacheAffinity.keyFromRequest(req) ?? opts.cacheAffinity.keyFromPayload(requestBody);
+  opts.profiler.add("http.body_read", stageStart);
+
+  stageStart = opts.profiler.now();
+  let affinityKey = opts.cacheAffinity.keyFromRequest(req);
+  opts.profiler.add("http.affinity_header", stageStart);
+  if (!affinityKey) {
+    stageStart = opts.profiler.now();
+    affinityKey = opts.cacheAffinity.keyFromPayload(requestBody);
+    opts.profiler.add("http.affinity_body", stageStart);
+  }
+
   const upstream = path === "responses/compact" ? opts.upstreamResponsesCompactUrl : opts.upstreamResponsesUrl;
+  stageStart = opts.profiler.now();
   opts.debugCapture.saveHttpRequest(req, pathname, path, affinityKey, requestBody);
+  opts.profiler.add("http.debug_capture", stageStart);
 
   for (let attempt = 0; attempt < opts.authStore.maxCredentialAttempts(); attempt++) {
+    stageStart = opts.profiler.now();
     const a = opts.cacheAffinity.choose(affinityKey, tried) ?? opts.authStore.choose(tried);
+    opts.profiler.add("http.auth_select", stageStart);
     if (!a) break;
     tried.push(a);
     try {
+      stageStart = opts.profiler.now();
       await opts.authStore.ensureFresh(a);
+      opts.profiler.add("http.ensure_fresh", stageStart);
       opts.log(`${req.method} ${pathname} -> ${upstream} as ${a.label}`);
-      const res = await fetch(upstream, { method: req.method, headers: buildHeaders(req, a), body: requestBody, duplex: "half" } as any);
+
+      stageStart = opts.profiler.now();
+      const headers = buildHeaders(req, a);
+      opts.profiler.add("http.headers", stageStart);
+
+      stageStart = opts.profiler.now();
+      const res = await fetch(upstream, { method: req.method, headers, body: requestBody, duplex: "half" } as any);
+      opts.profiler.add("http.fetch", stageStart);
 
       if (res.status === 401) {
         lastStatus = res.status;
@@ -68,7 +96,9 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
           const retry = await fetch(upstream, { method: req.method, headers: buildHeaders(req, a), body: requestBody, duplex: "half" } as any);
           if (!isRetryableHttpStatus(retry.status, opts.retryableHttpStatuses)) {
             opts.cacheAffinity.bind(affinityKey, a);
-            return withRotationHeaders(retry, a, attempt, exposeHeaders, home, opts.authStore.rrIndex, opts.authStore.auths.length);
+            const out = withRotationHeaders(retry, a, attempt, exposeHeaders, home, opts.authStore.rrIndex, opts.authStore.auths.length);
+            opts.profiler.add("http.total", totalStart);
+            return out;
           }
           lastStatus = retry.status;
           lastText = await retry.text().catch(() => "");
@@ -88,8 +118,12 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
         continue;
       }
 
+      stageStart = opts.profiler.now();
       opts.cacheAffinity.bind(affinityKey, a);
-      return withRotationHeaders(res, a, attempt, exposeHeaders, home, opts.authStore.rrIndex, opts.authStore.auths.length);
+      opts.profiler.add("http.affinity_bind", stageStart);
+      const out = withRotationHeaders(res, a, attempt, exposeHeaders, home, opts.authStore.rrIndex, opts.authStore.auths.length);
+      opts.profiler.add("http.total", totalStart);
+      return out;
     } catch (err) {
       lastStatus = 502;
       lastText = String(err);
@@ -98,7 +132,9 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
     }
   }
 
-  return jsonResponse({ error: { message: "all codex credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
+  const out = jsonResponse({ error: { message: "all codex credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
+  opts.profiler.add("http.total", totalStart);
+  return out;
 }
 
 export function buildHeaders(req: Request, a: AuthEntry): Headers {

@@ -6,6 +6,7 @@ import { CacheAffinityStore } from "./cache-affinity";
 import { DebugRequestCapture } from "./debug-capture";
 import { cooldownMsForFailure, jsonResponse, staticJsonResponse } from "./http-proxy";
 import { payloadBytes } from "./json-root-scan";
+import { Profiler } from "./profiler";
 
 const WS_UPGRADE_FAILED_BODY = JSON.stringify({ error: { message: "websocket upgrade failed" } }, null, 2);
 const COMPACT_ROOT_TYPE_PREFIX = '{"type":"';
@@ -21,23 +22,31 @@ interface WsProxyOptions {
   connectTimeoutMs: number;
   cooldownMs: number;
   exposeRotationHeaders: boolean;
+  profiler: Profiler;
   zigCore: () => ZigCore | undefined;
   log: (...args: unknown[]) => void;
 }
 
 export async function proxyWebSocketUpgrade(req: Request, server: any, path: string, pathname: string, opts: WsProxyOptions): Promise<Response> {
+  const totalStart = opts.profiler.now();
+  let stageStart = opts.profiler.now();
   const affinityKey = opts.cacheAffinity.keyFromRequest(req);
+  opts.profiler.add("ws.affinity_header", stageStart);
   const tried: AuthEntry[] = [];
   let lastStatus = 0;
   let lastText = "";
 
   for (let attempt = 0; attempt < opts.authStore.maxCredentialAttempts(); attempt++) {
+    stageStart = opts.profiler.now();
     const a = opts.cacheAffinity.choose(affinityKey, tried) ?? opts.authStore.choose(tried);
+    opts.profiler.add("ws.auth_select", stageStart);
     if (!a) break;
     tried.push(a);
 
     try {
+      stageStart = opts.profiler.now();
       await opts.authStore.ensureFresh(a);
+      opts.profiler.add("ws.ensure_fresh", stageStart);
     } catch (err) {
       lastStatus = 401;
       lastText = String(err);
@@ -57,6 +66,7 @@ export async function proxyWebSocketUpgrade(req: Request, server: any, path: str
 
     connected.data.cacheAffinityKey = affinityKey;
     connected.data.frameCacheAffinityBound = !!affinityKey;
+    stageStart = opts.profiler.now();
     const ok = server.upgrade(req, {
       data: connected.data,
       headers: opts.exposeRotationHeaders ? {
@@ -66,32 +76,49 @@ export async function proxyWebSocketUpgrade(req: Request, server: any, path: str
         "x-cd-proxy-next-rr-index": String(opts.authStore.rrIndex),
       } : undefined,
     });
+    opts.profiler.add("ws.client_upgrade", stageStart);
     if (!ok) {
       try { connected.data.upstream.close(); } catch {}
+      opts.profiler.add("ws.total", totalStart);
       return staticJsonResponse(WS_UPGRADE_FAILED_BODY, 400);
     }
+    stageStart = opts.profiler.now();
     opts.cacheAffinity.bind(affinityKey, a);
+    opts.profiler.add("ws.affinity_bind", stageStart);
+    stageStart = opts.profiler.now();
     opts.debugCapture.saveWebSocketHandshake(req, pathname, connected.data.upstreamUrl, affinityKey, a.label, a.path, attempt);
+    opts.profiler.add("ws.debug_capture", stageStart);
     opts.transportStats.responsesWebSocketUpgrades++;
+    opts.profiler.add("ws.total", totalStart);
     return undefined as any;
   }
 
-  return jsonResponse({ error: { message: "all codex websocket credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
+  const out = jsonResponse({ error: { message: "all codex websocket credentials failed or are cooling down", status: lastStatus, detail: lastText.slice(0, 1000) } }, { status: lastStatus || 503 });
+  opts.profiler.add("ws.total", totalStart);
+  return out;
 }
 
-export function handleClientWebSocketMessage(ws: ServerWebSocket<WsProxyData>, message: string | Buffer, cacheAffinity: CacheAffinityStore, debugCapture: DebugRequestCapture) {
+export function handleClientWebSocketMessage(ws: ServerWebSocket<WsProxyData>, message: string | Buffer, cacheAffinity: CacheAffinityStore, debugCapture: DebugRequestCapture, profiler: Profiler) {
+  const totalStart = profiler.now();
   let frameAffinityKey: string | undefined;
   if (!ws.data.frameCacheAffinityBound) {
     ws.data.frameCacheAffinityBound = true;
+    const stageStart = profiler.now();
     frameAffinityKey = cacheAffinity.keyFromPayload(message);
+    profiler.add("ws.frame.affinity_body", stageStart);
     if (frameAffinityKey) {
       ws.data.cacheAffinityKey = frameAffinityKey;
       cacheAffinity.bindByPath(frameAffinityKey, ws.data.authPath);
     }
   }
+  let stageStart = profiler.now();
   debugCapture.saveWebSocketClientMessage(ws.data, message, frameAffinityKey);
+  profiler.add("ws.frame.debug_capture", stageStart);
+  stageStart = profiler.now();
   if (ws.data.upstreamOpen) ws.data.upstream.send(message as any);
   else ws.data.queue.push(message as any);
+  profiler.add("ws.frame.send_upstream", stageStart);
+  profiler.add("ws.frame.total", totalStart);
 }
 
 function buildWebSocketHeaders(req: Request, a: AuthEntry): Record<string, string> {
@@ -126,13 +153,19 @@ async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string
   const upstreamUrl = websocketUrlForPath(path, opts);
   let upstream: WebSocket;
   try {
-    upstream = new WebSocket(upstreamUrl, { headers: buildWebSocketHeaders(req, a) });
+    let stageStart = opts.profiler.now();
+    const headers = buildWebSocketHeaders(req, a);
+    opts.profiler.add("ws.headers", stageStart);
+    stageStart = opts.profiler.now();
+    upstream = new WebSocket(upstreamUrl, { headers });
+    opts.profiler.add("ws.upstream_ctor", stageStart);
   } catch (err) {
     return { ok: false, status: 502, detail: String(err) };
   }
   upstream.binaryType = "arraybuffer";
 
   const data: WsProxyData = { upstream, upstreamOpen: false, queue: [], downstreamQueue: [], authPath: a.path, authLabel: a.label, pathname, upstreamUrl, frameCacheAffinityBound: false };
+  const openStart = opts.profiler.now();
   const opened = await new Promise<{ ok: true } | { ok: false; status: number; detail: string }>((resolve) => {
     let settled = false;
     const finish = (result: { ok: true } | { ok: false; status: number; detail: string }) => {
@@ -147,6 +180,7 @@ async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string
     }, Math.max(1, opts.connectTimeoutMs));
 
     upstream.addEventListener("open", () => {
+      opts.profiler.add("ws.upstream_open_wait", openStart);
       opts.transportStats.responsesWebSocketUpstreamOpens++;
       data.upstreamOpen = true;
       opts.log(`WS ${pathname} -> ${upstreamUrl} as ${a.label}`);
@@ -154,11 +188,17 @@ async function connectUpstreamWebSocket(req: Request, a: AuthEntry, path: string
       finish({ ok: true });
     });
     upstream.addEventListener("message", (event: MessageEvent) => {
+      const totalStart = opts.profiler.now();
       const payload = event.data;
       const client = (upstream as any).__client;
+      let stageStart = opts.profiler.now();
       if (client) client.send(payload as any);
       else data.downstreamQueue.push(payload as any);
+      opts.profiler.add("ws.upstream_message.send_client", stageStart);
+      stageStart = opts.profiler.now();
       if (isTerminalResponseEventPayload(payload, opts.zigCore())) opts.transportStats.responsesWebSocketTerminalEvents++;
+      opts.profiler.add("ws.upstream_message.terminal_detect", stageStart);
+      opts.profiler.add("ws.upstream_message.total", totalStart);
     });
     upstream.addEventListener("close", (event: CloseEvent) => {
       if (!data.upstreamOpen) {

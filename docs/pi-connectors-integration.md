@@ -155,6 +155,7 @@ Useful flags: `--provider`, `--model`, `--api-key`, `--thinking`, `--models`, `-
 | `WS /responses`, `/v1/responses`, `/codex/responses` | WebSocket Responses path. |
 | `POST /responses/compact`, `/v1/responses/compact`, `/codex/responses/compact` | Compact endpoint. |
 | `GET /debug/rotation?count=N` | Preview round-robin picks. |
+| `GET /debug/profile/reset` | Reset in-memory profile timings when `CD_PROXY_PROFILE=1`. |
 
 ## Headers and request params
 
@@ -207,6 +208,7 @@ Optional debug response headers when `CD_PROXY_EXPOSE_ROTATION_HEADERS=1`:
 | `CD_PROXY_WS_MAX_PAYLOAD_BYTES` | `67108864` | Max single WS frame. |
 | `CD_PROXY_EXPOSE_ROTATION_HEADERS` | `0` | Integration debugging only. |
 | `CD_PROXY_DEBUG` | `0` | Verbose logs. |
+| `CD_PROXY_PROFILE` | `0` | Per-stage profile timings in `/health` and `/status`; benchmark/debug only. |
 | `CD_PROXY_DEBUG_SAVE_REQUESTS` | `0` | Save proxied HTTP requests and WebSocket client frames asynchronously for debugging; sensitive headers are redacted. |
 | `CD_PROXY_DEBUG_SAVE_DIR` | `~/.local/share/cd-proxy/debug-requests` | Directory for debug request snapshots. |
 | `CD_PROXY_DEBUG_SAVE_BODY_BYTES` | `1048576` | Per-request/body bytes saved before truncation. |

@@ -6,6 +6,7 @@ import { CacheAffinityStore } from "./cache-affinity";
 import { DebugRequestCapture } from "./debug-capture";
 import { jsonResponse, jsonTextResponse, proxyWithRotation, staticJsonResponse } from "./http-proxy";
 import { handleClientWebSocketMessage, proxyWebSocketUpgrade } from "./websocket-proxy";
+import { Profiler } from "./profiler";
 
 // Kept here for the native implementation assertion script.
 const DEFAULT_CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex";
@@ -63,6 +64,8 @@ const debugCapture = new DebugRequestCapture({
   maxPending: CONFIG.DEBUG_SAVE_MAX_PENDING,
   home: CONFIG.HOME,
 });
+
+const profiler = new Profiler(CONFIG.PROFILE);
 
 async function loadApiKey() {
   if (process.env.CD_PROXY_API_KEY) {
@@ -160,6 +163,7 @@ function publicStatus() {
     transport_stats: transportStats,
     cache_affinity: cacheAffinity.info(),
     debug_request_capture: debugCapture.info(),
+    profile: { enabled: profiler.enabled, timings: profiler.snapshot() },
     zig_core: !!zigCore,
     zig_core_path: CONFIG.ZIG_CORE_PATH,
     auths: authStore.auths.map((a) => authStore.publicInfo(a)),
@@ -184,6 +188,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
       connectTimeoutMs: CONFIG.WS_CONNECT_TIMEOUT_MS,
       cooldownMs: CONFIG.COOLDOWN_MS,
       exposeRotationHeaders: CONFIG.EXPOSE_ROTATION_HEADERS,
+      profiler,
       zigCore: () => zigCore,
       log,
     });
@@ -199,6 +204,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
       transport_stats: transportStats,
       cache_affinity: cacheAffinity.info(),
       debug_request_capture: debugCapture.info(),
+      profile: { enabled: profiler.enabled, timings: profiler.snapshot() },
       zig_core: !!zigCore,
     });
   }
@@ -212,6 +218,11 @@ async function handle(req: Request, server?: any): Promise<Response> {
   if (unauthorized(req)) return staticJsonResponse(UNAUTHORIZED_BODY, 401);
 
   if (pathname === "/status" || pathname === "/v1/status") return jsonResponse(publicStatus());
+
+  if (pathname === "/debug/profile/reset" || pathname === "/v1/debug/profile/reset") {
+    profiler.reset();
+    return jsonResponse({ ok: true, profile: { enabled: profiler.enabled, timings: profiler.snapshot() } });
+  }
 
   if (pathname === "/debug/rotation" || pathname === "/v1/debug/rotation") {
     const count = Math.min(100, Math.max(1, Number(requestSearchParam(req.url, "count") ?? String(authStore.auths.length || 1))));
@@ -237,6 +248,7 @@ async function handle(req: Request, server?: any): Promise<Response> {
     upstreamResponsesCompactUrl: CONFIG.UPSTREAM_RESPONSES_COMPACT_URL,
     retryableHttpStatuses: CONFIG.RETRYABLE_HTTP_STATUSES,
     cooldownMs: CONFIG.COOLDOWN_MS,
+    profiler,
     log,
   }, CONFIG.EXPOSE_ROTATION_HEADERS, CONFIG.HOME);
 }
@@ -278,7 +290,7 @@ Bun.serve({
       for (const msg of ws.data.downstreamQueue.splice(0)) ws.send(msg as any);
     },
     message(ws: ServerWebSocket<WsProxyData>, message: string | Buffer) {
-      handleClientWebSocketMessage(ws, message, cacheAffinity, debugCapture);
+      handleClientWebSocketMessage(ws, message, cacheAffinity, debugCapture, profiler);
     },
     close(ws: ServerWebSocket<WsProxyData>) {
       try { ws.data.upstream.close(); } catch {}

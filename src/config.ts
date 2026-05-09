@@ -76,6 +76,7 @@ export const CONFIG = {
   PORT: Number(process.env.CD_PROXY_PORT ?? "8318"),
   HOST: process.env.CD_PROXY_HOST ?? "127.0.0.1",
   DEBUG: envFlag("CD_PROXY_DEBUG"),
+  PROFILE: envFlag("CD_PROXY_PROFILE"),
   DEBUG_SAVE_REQUESTS: envFlag("CD_PROXY_DEBUG_SAVE_REQUESTS"),
   DEBUG_SAVE_DIR: expandHome(process.env.CD_PROXY_DEBUG_SAVE_DIR ?? "~/.local/share/cd-proxy/debug-requests"),
   DEBUG_SAVE_BODY_BYTES: Math.max(0, Math.floor(envNumber("CD_PROXY_DEBUG_SAVE_BODY_BYTES", 1024 * 1024))),
