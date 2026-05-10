@@ -252,6 +252,8 @@ Persistent fix: keep disabled by default, bounded and async when enabled.
 | Single-pass HTTP header object | Rejected | Runtime benchmark showed it slower than Bun `Headers`. |
 | Native quote-search JSON scanner | Accepted | 64KiB body scan ~18.6x faster than `JSON.parse`. |
 | `CD_PROXY_PROFILE` stage profiler | Accepted | Provides precise stage timings without default runtime work. |
+| C cache-affinity scanner via FFI | Rejected | Small bodies were slower in repeat runs; 64KiB bodies only gained modestly and body scanning is not the dominant end-to-end bottleneck. |
+| Rust/C full proxy port | Rejected for now | Stage profiling shows Bun network/WS handoff dominates; moving request orchestration would risk reliability without proven speedup. |
 
 ## 7. Next optimization backlog
 
