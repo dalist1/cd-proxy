@@ -80,37 +80,6 @@ const req = new Request("http://127.0.0.1:8318/v1/responses", {
   body: JSON.stringify({ input: "bench" }),
 });
 
-function singlePassHttpHeaders(req: Request, a: AuthEntry): Record<string, string> {
-  const h: Record<string, string> = {};
-  let hasAccept = false;
-  let hasContentType = false;
-  for (const [name, value] of req.headers) {
-    switch (name) {
-      case "host":
-      case "connection":
-      case "content-length":
-      case "authorization":
-      case "chatgpt-account-id":
-        continue;
-      case "accept":
-        hasAccept = true;
-        h.accept = value;
-        continue;
-      case "content-type":
-        hasContentType = true;
-        h["content-type"] = value;
-        continue;
-      default:
-        h[name] = value;
-    }
-  }
-  h.authorization = `Bearer ${a.data.access_token}`;
-  if (!hasContentType) h["content-type"] = "application/json";
-  if (!hasAccept && req.method !== "GET") h.accept = "text/event-stream";
-  if (a.data.account_id) h["ChatGPT-Account-ID"] = a.data.account_id;
-  return h;
-}
-
 const fields = new Set(["prompt_cache_key", "session_id"]);
 const smallBody = Buffer.from(JSON.stringify({ model: "gpt-5.3-codex", prompt_cache_key: "bench-session", input: [{ role: "user", content: "hello" }] }));
 const largeBody = Buffer.from(JSON.stringify({
@@ -155,11 +124,8 @@ authStore.enabledCount = 1;
 console.log(`cd-proxy proxy-hot-path benchmark (${FAST ? "fast" : "full"}, repeats=${REPEATS})`);
 console.log(`iterations: hot=${ITERS}, body=${BODY_ITERS}\n`);
 
-printPair(
-  "HTTP upstream header construction candidate",
-  bench("runtime Headers clone/delete", ITERS, () => buildHeaders(req, auth).get("authorization")),
-  bench("candidate single-pass object", ITERS, () => singlePassHttpHeaders(req, auth).authorization),
-);
+console.log("Current runtime helpers");
+print(bench("HTTP upstream header construction", ITERS, () => buildHeaders(req, auth).get("authorization")));
 
 printPair(
   "JSON cache-key extraction, small body",
@@ -173,7 +139,7 @@ printPair(
   bench("byte root-field scanner large", Math.max(1000, Math.floor(BODY_ITERS / 10)), () => jsonRootStringFieldValue(largeBody, fields)),
 );
 
-console.log("\nCurrent hot-path helpers");
+console.log("\nOther hot-path helpers");
 print(bench("cache affinity key from header", ITERS, () => affinity.keyFromRequest(req)));
 print(bench("cache affinity lookup hit", ITERS, () => affinity.choose("cache:bench-session")?.label));
 print(bench("auth round-robin choose one", ITERS, () => authStore.choose()?.label));

@@ -72,14 +72,13 @@ bun run test
 
 | Path | Finding |
 |---|---|
-| Runtime HTTP `Headers` clone/delete | 815,457 ops/s; kept. |
-| Candidate single-pass HTTP object | 641,426 ops/s; rejected, 1.27x slower. |
-| Small JSON cache-key scanner | 1,694,765 ops/s; 1.38x faster than `JSON.parse`. |
-| 64KiB JSON cache-key scanner | 504,109 ops/s; 18.59x faster than `JSON.parse`. |
-| Header affinity key extraction | 7,685,634 ops/s. |
-| Cache-affinity lookup hit | 6,498,533 ops/s. |
-| Auth round-robin choose one | 17,713,459 ops/s. |
-| Debug capture disabled call | 159,487,090 ops/s. |
+| Runtime HTTP header construction | 404,043 ops/s. |
+| Small JSON cache-key scanner | 852,756 ops/s; 1.65x faster than `JSON.parse`. |
+| 64KiB JSON cache-key scanner | 330,678 ops/s; 16.26x faster than `JSON.parse`. |
+| Header affinity key extraction | 3,889,235 ops/s. |
+| Cache-affinity lookup hit | 4,022,436 ops/s. |
+| Auth round-robin choose one | 12,101,532 ops/s. |
+| Debug capture disabled call | 114,100,545 ops/s. |
 
 ### 4.3 `bench:stage-profile`
 
@@ -249,11 +248,9 @@ Persistent fix: keep disabled by default, bounded and async when enabled.
 | Prebuilt models body | Accepted | Hundreds of times faster than per-request stringify. |
 | Text terminal-event sentinel | Accepted | Tens of millions ops/s, avoids per-frame `JSON.parse`. |
 | Zig binary terminal detector | Accepted | Faster than decoded JSON parse for binary frames. |
-| Single-pass HTTP header object | Rejected | Runtime benchmark showed it slower than Bun `Headers`. |
-| Native quote-search JSON scanner | Accepted | 64KiB body scan ~18.6x faster than `JSON.parse`. |
+| Native quote-search JSON scanner | Accepted | 64KiB body scan ~16x faster than `JSON.parse`. |
 | `CD_PROXY_PROFILE` stage profiler | Accepted | Provides precise stage timings without default runtime work. |
-| C cache-affinity scanner via FFI | Rejected | Small bodies were slower in repeat runs; 64KiB bodies only gained modestly and body scanning is not the dominant end-to-end bottleneck. |
-| Rust/C full proxy port | Rejected for now | Stage profiling shows Bun network/WS handoff dominates; moving request orchestration would risk reliability without proven speedup. |
+| Native C/Rust ports | Not kept | Benchmarks did not show a meaningful end-to-end speedup on dominant paths, so no native port code is retained. |
 
 ## 7. Next optimization backlog
 

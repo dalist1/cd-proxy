@@ -81,14 +81,13 @@ Results:
 
 | Hot path | Result / finding |
 |---|---|
-| Runtime HTTP `Headers` clone/delete | 815,457 ops/s; kept because candidate JS object path was slower. |
-| Candidate single-pass HTTP header object | Rejected; 1.27x slower. |
-| Small JSON cache-key scanner | 1,694,765 ops/s; 1.38x faster than `JSON.parse`. |
-| 64KiB JSON cache-key scanner | 504,109 ops/s; 18.59x faster than `JSON.parse`. |
-| Header affinity key extraction | 7,685,634 ops/s. |
-| Cache-affinity lookup hit | 6,498,533 ops/s. |
-| Auth round-robin choose one | 17,713,459 ops/s. |
-| Debug capture disabled call | 159,487,090 ops/s. |
+| Runtime HTTP header construction | 404,043 ops/s. |
+| Small JSON cache-key scanner | 852,756 ops/s; 1.65x faster than `JSON.parse`. |
+| 64KiB JSON cache-key scanner | 330,678 ops/s; 16.26x faster than `JSON.parse`. |
+| Header affinity key extraction | 3,889,235 ops/s. |
+| Cache-affinity lookup hit | 4,022,436 ops/s. |
+| Auth round-robin choose one | 12,101,532 ops/s. |
+| Debug capture disabled call | 114,100,545 ops/s. |
 
 ## Latest stage-profile result
 
