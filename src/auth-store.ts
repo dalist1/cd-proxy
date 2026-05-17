@@ -33,6 +33,9 @@ export class AuthStore {
   auths: AuthEntry[] = [];
   enabledCount = 0;
   private rr = 0;
+  private lastChosenPath: string | undefined;
+  private readonly cooldownUntilByPath = new Map<string, number>();
+  private readonly refreshInFlightByPath = new Map<string, Promise<void>>();
   private unavailableFlags = new Uint8Array(0);
   private readonly authJsonViewScratch = Buffer.alloc(AUTH_JSON_VIEW_BYTES);
 
@@ -48,6 +51,8 @@ export class AuthStore {
   }
 
   async load() {
+    const previousAuths = this.auths;
+    const previousNextPath = previousAuths.length ? previousAuths[this.rr % previousAuths.length]?.path : undefined;
     const next: AuthEntry[] = [];
     const names = (await readdir(this.opts.authDir).catch(() => []))
       .filter((name) => name.startsWith("codex-") && name.endsWith(".json"))
@@ -59,14 +64,15 @@ export class AuthStore {
         const data = this.parseAuthJson(await readFile(path));
         if (data.type && data.type !== "codex") continue;
         if (!data.access_token || !data.refresh_token) continue;
-        const old = this.auths.find((a) => a.path === path);
+        const old = previousAuths.find((a) => a.path === path);
+        const coolingUntil = Math.max(old?.coolingUntil ?? 0, this.cooldownUntilByPath.get(path) ?? 0);
         next.push({
           path,
           label: data.email ?? name.replace(/^codex-/, "").replace(/\.json$/, ""),
           data,
           expiresAtMs: this.computeExpiryMs(data),
-          coolingUntil: old?.coolingUntil ?? 0,
-          refreshInFlight: old?.refreshInFlight,
+          coolingUntil,
+          refreshInFlight: old?.refreshInFlight ?? this.refreshInFlightByPath.get(path),
         });
       } catch (err) {
         console.error(`failed to load ${path}:`, err);
@@ -75,7 +81,8 @@ export class AuthStore {
 
     this.auths = next;
     this.enabledCount = this.auths.reduce((count, a) => count + (a.data.disabled ? 0 : 1), 0);
-    if (this.rr >= this.auths.length) this.rr = 0;
+    this.realignRoundRobinAfterLoad(previousNextPath);
+    this.pruneCooldowns();
     this.opts.log(`loaded ${this.auths.length} codex auth(s) from ${this.opts.authDir}`);
   }
 
@@ -88,14 +95,14 @@ export class AuthStore {
       if (this.unavailableFlags.length < this.auths.length) this.unavailableFlags = new Uint8Array(this.auths.length);
       for (let i = 0; i < this.auths.length; i++) {
         const a = this.auths[i];
-        this.unavailableFlags[i] = this.isExcluded(exclude, a) || a.data.disabled || a.coolingUntil > now ? 1 : 0;
+        this.unavailableFlags[i] = this.isExcluded(exclude, a) || a.data.disabled || this.coolingUntil(a) > now ? 1 : 0;
       }
       const flagsPtr = ptr(this.unavailableFlags);
       if (flagsPtr) {
         const idx = zigCore.cdproxy_pick_next_flags(this.auths.length, this.rr % this.auths.length, flagsPtr as any);
         if (idx >= 0) {
           this.rr = idx + 1;
-          return this.auths[idx];
+          return this.markChosen(this.auths[idx]);
         }
         this.rr += this.auths.length;
         return undefined;
@@ -105,8 +112,8 @@ export class AuthStore {
     for (let i = 0; i < this.auths.length; i++) {
       const idx = this.rr++ % this.auths.length;
       const a = this.auths[idx];
-      if (this.isExcluded(exclude, a) || a.data.disabled || a.coolingUntil > now) continue;
-      return a;
+      if (this.isExcluded(exclude, a) || a.data.disabled || this.coolingUntil(a) > now) continue;
+      return this.markChosen(a);
     }
     return undefined;
   }
@@ -115,23 +122,54 @@ export class AuthStore {
     if (this.isTokenExpiring(a)) await this.refresh(a);
   }
 
+  cooldown(a: AuthEntry, durationMs: number) {
+    const now = Date.now();
+    const duration = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
+    const until = now + duration;
+    a.coolingUntil = until;
+    const current = this.auths.find((entry) => entry.path === a.path);
+    if (current) current.coolingUntil = until;
+    if (until > now) this.cooldownUntilByPath.set(a.path, until);
+    else this.cooldownUntilByPath.delete(a.path);
+  }
+
   async refresh(a: AuthEntry): Promise<void> {
-    if (a.refreshInFlight) return a.refreshInFlight;
-    a.refreshInFlight = (async () => {
+    const existing = a.refreshInFlight ?? this.refreshInFlightByPath.get(a.path);
+    if (existing) return existing;
+
+    const path = a.path;
+    let refreshPromise!: Promise<void>;
+    refreshPromise = (async () => {
       this.opts.log(`refreshing ${a.label} (${this.redact(a.data.refresh_token)})`);
       const refreshed = await refreshCodexTokens(a.data.refresh_token);
-      a.data.access_token = refreshed.access_token;
-      a.data.refresh_token = refreshed.refresh_token;
-      if (refreshed.id_token) a.data.id_token = refreshed.id_token;
-      if (refreshed.expired) a.data.expired = refreshed.expired;
-      a.data.last_refresh = refreshed.last_refresh;
-      a.expiresAtMs = this.computeExpiryMs(a.data);
-      const claims = this.decodeJwtClaims(a.data.id_token);
-      a.data.email ??= claims?.email ?? claims?.["https://api.openai.com/profile"]?.email;
-      a.data.account_id ??= claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-      await writeFile(a.path, JSON.stringify(a.data) + "\n", { mode: 0o600 });
-    })().finally(() => { a.refreshInFlight = undefined; });
-    return a.refreshInFlight;
+      const applyRefreshed = (target: AuthEntry) => {
+        target.data.access_token = refreshed.access_token;
+        target.data.refresh_token = refreshed.refresh_token;
+        if (refreshed.id_token) target.data.id_token = refreshed.id_token;
+        if (refreshed.expired) target.data.expired = refreshed.expired;
+        target.data.last_refresh = refreshed.last_refresh;
+        target.expiresAtMs = this.computeExpiryMs(target.data);
+        const claims = this.decodeJwtClaims(target.data.id_token);
+        target.data.email ??= claims?.email ?? claims?.["https://api.openai.com/profile"]?.email;
+        target.data.account_id ??= claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+      };
+
+      applyRefreshed(a);
+      const current = this.auths.find((entry) => entry.path === path);
+      if (current && current !== a) applyRefreshed(current);
+      await writeFile(path, JSON.stringify(a.data) + "\n", { mode: 0o600 });
+    })().finally(() => {
+      if (a.refreshInFlight === refreshPromise) a.refreshInFlight = undefined;
+      const current = this.auths.find((entry) => entry.path === path);
+      if (current && current.refreshInFlight === refreshPromise) current.refreshInFlight = undefined;
+      if (this.refreshInFlightByPath.get(path) === refreshPromise) this.refreshInFlightByPath.delete(path);
+    });
+
+    a.refreshInFlight = refreshPromise;
+    this.refreshInFlightByPath.set(path, refreshPromise);
+    const current = this.auths.find((entry) => entry.path === path);
+    if (current) current.refreshInFlight = refreshPromise;
+    return refreshPromise;
   }
 
   publicInfo(a: AuthEntry) {
@@ -139,7 +177,7 @@ export class AuthStore {
       label: a.label,
       account_id_prefix: a.data.account_id ? a.data.account_id.slice(0, 5) : undefined,
       disabled: !!a.data.disabled,
-      cooling_ms: Math.max(0, a.coolingUntil - Date.now()),
+      cooling_ms: Math.max(0, this.coolingUntil(a) - Date.now()),
       expired: a.data.expired,
       file: a.path.replace(this.opts.home, "~"),
     };
@@ -218,8 +256,60 @@ export class AuthStore {
     return a.expiresAtMs !== undefined && Date.now() + this.opts.refreshSkewMs >= a.expiresAtMs;
   }
 
+  private realignRoundRobinAfterLoad(previousNextPath: string | undefined) {
+    // Auth files are sorted on every reload. If a new file sorts before the
+    // numeric cursor, preserving only the index can repeat the just-used auth.
+    // Anchor the cursor to stable auth file paths instead.
+    if (this.auths.length === 0) {
+      this.rr = 0;
+      this.lastChosenPath = undefined;
+      return;
+    }
+
+    if (this.lastChosenPath) {
+      const lastIdx = this.auths.findIndex((a) => a.path === this.lastChosenPath);
+      if (lastIdx >= 0) {
+        this.rr = (lastIdx + 1) % this.auths.length;
+        return;
+      }
+      this.lastChosenPath = undefined;
+    }
+
+    if (previousNextPath) {
+      const nextIdx = this.auths.findIndex((a) => a.path === previousNextPath);
+      if (nextIdx >= 0) {
+        this.rr = nextIdx;
+        return;
+      }
+    }
+
+    this.rr %= this.auths.length;
+  }
+
+  private pruneCooldowns() {
+    const now = Date.now();
+    const paths = new Set(this.auths.map((a) => a.path));
+    for (const [path, until] of this.cooldownUntilByPath) {
+      if (until <= now || !paths.has(path)) this.cooldownUntilByPath.delete(path);
+    }
+    for (const a of this.auths) {
+      if (a.coolingUntil > now) this.cooldownUntilByPath.set(a.path, a.coolingUntil);
+    }
+  }
+
+  private markChosen(a: AuthEntry): AuthEntry {
+    this.lastChosenPath = a.path;
+    return a;
+  }
+
+  private coolingUntil(a: AuthEntry): number {
+    const mapped = this.cooldownUntilByPath.get(a.path) ?? 0;
+    if (mapped > a.coolingUntil) a.coolingUntil = mapped;
+    return a.coolingUntil;
+  }
+
   private isExcluded(exclude: AuthEntry[] | undefined, a: AuthEntry): boolean {
-    return !!exclude && exclude.includes(a);
+    return !!exclude && exclude.some((entry) => entry === a || entry.path === a.path);
   }
 
   private redact(s?: string) {

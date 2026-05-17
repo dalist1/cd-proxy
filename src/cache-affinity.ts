@@ -71,7 +71,7 @@ export class CacheAffinityStore {
       this.stats.misses++;
       return undefined;
     }
-    if (a.data.disabled || a.coolingUntil > now || (!!exclude && exclude.includes(a))) {
+    if (a.data.disabled || a.coolingUntil > now || this.isExcluded(exclude, a)) {
       this.stats.unavailable++;
       return undefined;
     }
@@ -115,6 +115,10 @@ export class CacheAffinityStore {
 
   private get active() {
     return this.opts.enabled && this.opts.ttlMs > 0;
+  }
+
+  private isExcluded(exclude: AuthEntry[] | undefined, a: AuthEntry): boolean {
+    return !!exclude && exclude.some((entry) => entry === a || entry.path === a.path);
   }
 
   private normalizedKey(value: string | undefined | null): string | undefined {

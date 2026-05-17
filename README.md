@@ -82,7 +82,7 @@ Supported proxy paths:
 
 Round-robin behavior:
 
-1. Loads `codex-*.json` auth files from the cd-proxy auth dir.
+1. Loads `codex-*.json` auth files from the cd-proxy auth dir and keeps the cursor aligned by auth file path across reloads.
 2. Picks the next enabled credential for every HTTP request and WebSocket connection.
 3. When cache/session affinity is enabled, requests with the same cache-affinity value (default headers: `session_id`/`x-session-affinity`; default JSON body fields: `prompt_cache_key`/`session_id`) stick to the same credential while the affinity entry is valid, improving upstream prompt-cache hit rates.
 4. Refreshes a credential before use if its expiry is near.
@@ -233,6 +233,7 @@ Run the native auth checks plus the granular rotation suite. The auth check veri
 
 - exact A → B → C → A → B → C per-request routing
 - disabled credentials are skipped after `/reload`
+- adding a new auth file that sorts before the current cursor does not repeat the just-used credential after `/reload`
 - `429` cools the failing credential and retries the next credential in the same external request
 - `5xx` upstream failures are retried on the next credential instead of being returned when another account succeeds
 - WebSocket upstream handshake failures rotate to the next credential before the client is upgraded

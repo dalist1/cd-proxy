@@ -105,7 +105,7 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
         } catch (err) {
           lastText = String(err);
         }
-        a.coolingUntil = Date.now() + opts.cooldownMs;
+        opts.authStore.cooldown(a, opts.cooldownMs);
         opts.log(`cooling ${a.label} after 401/refresh retry failure: ${lastStatus} ${lastText.slice(0, 160)}`);
         continue;
       }
@@ -113,7 +113,7 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
       if (isRetryableHttpStatus(res.status, opts.retryableHttpStatuses)) {
         lastStatus = res.status;
         lastText = await res.text().catch(() => "");
-        a.coolingUntil = Date.now() + cooldownMsForFailure(res.status, opts.cooldownMs);
+        opts.authStore.cooldown(a, cooldownMsForFailure(res.status, opts.cooldownMs));
         opts.log(`cooling ${a.label} after retryable upstream status ${res.status}: ${lastText.slice(0, 160)}`);
         continue;
       }
@@ -127,7 +127,7 @@ export async function proxyWithRotation(req: Request, path: string, pathname: st
     } catch (err) {
       lastStatus = 502;
       lastText = String(err);
-      a.coolingUntil = Date.now() + cooldownMsForFailure(502, opts.cooldownMs);
+      opts.authStore.cooldown(a, cooldownMsForFailure(502, opts.cooldownMs));
       opts.log(`cooling ${a.label} after upstream fetch failure: ${lastText.slice(0, 160)}`);
     }
   }

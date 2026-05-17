@@ -166,6 +166,31 @@ async function main() {
     await stop(mock);
   }
 
+  const authDirInserted = join(tmp, "auths-insert-before-cursor");
+  await Bun.$`mkdir -p ${authDirInserted}`.quiet();
+  await writeAuth(authDirInserted, 1, false);
+  await writeAuth(authDirInserted, 2, false);
+  const mockPortInserted = 21510 + Math.floor(Math.random() * 1000);
+  const proxyPortInserted = 11350 + Math.floor(Math.random() * 1000);
+  mock = await startMock(tmp, mockPortInserted);
+  proxy = await startProxy(authDirInserted, mockPortInserted, proxyPortInserted);
+  try {
+    console.log("scenario 2b: reload with a new earlier-sorting auth preserves the next account");
+    const first = await request(proxyPortInserted);
+    assert(first.body.account === ACCOUNTS[1], `initial two-account sequence should start at B, got ${first.body.account}`);
+    await writeAuth(authDirInserted, 0, false); // A sorts before the current B/C cursor.
+    const reload = await fetch(`http://127.0.0.1:${proxyPortInserted}/reload`, { method: "POST", headers: { authorization: `Bearer ${API_KEY}` } });
+    assert(reload.ok, `reload after inserted auth failed ${reload.status}`);
+    const second = await request(proxyPortInserted);
+    const third = await request(proxyPortInserted);
+    const insertedSeq = [first.body.account, second.body.account, third.body.account];
+    console.log(insertedSeq.map((a, i) => `${i}:${a}`).join(" "));
+    assert(insertedSeq.join(",") === [ACCOUNTS[1], ACCOUNTS[2], ACCOUNTS[0]].join(","), "reload inserted-auth sequence should not repeat the just-used account");
+  } finally {
+    await stop(proxy);
+    await stop(mock);
+  }
+
   // Re-enable B and test that a 429 causes same external request to rotate to C, while the mock log proves B was tried.
   await writeAuth(authDir, 1, false);
   const mockPort2 = 19510 + Math.floor(Math.random() * 1000);

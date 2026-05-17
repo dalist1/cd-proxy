@@ -389,7 +389,7 @@ export fn cdproxy_jwt_exp_ms(data: [*]const u8, len: usize) f64 {
 }
 
 test "pick_next_flags supports larger flag arrays" {
-    var unavailable = [_]u8{0} ** 40;
+    var unavailable = std.mem.zeroes([40]u8);
     unavailable[38] = 1;
     try std.testing.expectEqual(@as(i32, 39), cdproxy_pick_next_flags(40, 38, unavailable[0..].ptr));
     unavailable[39] = 1;

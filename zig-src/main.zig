@@ -449,7 +449,7 @@ fn respondStatus(state: *State, req: *std.http.Server.Request, allocator: std.me
 fn respondDebugRotation(state: *State, req: *std.http.Server.Request, target: []const u8, allocator: std.mem.Allocator) !void {
     const raw_count = try targetQueryParam(allocator, target, "count") orelse "";
     const count = if (raw_count.len == 0) @max(@as(usize, 1), state.auths.len) else @min(@as(usize, 100), std.fmt.parseInt(usize, raw_count, 10) catch 1);
-    const tried_buf = [_]usize{0} ** 256;
+    const tried_buf = std.mem.zeroes([256]usize);
     var w = std.Io.Writer.Allocating.init(allocator);
     defer w.deinit();
     try w.writer.print("{{\n  \"ok\": true,\n  \"count\": {d},\n  \"picked\": [\n", .{count});

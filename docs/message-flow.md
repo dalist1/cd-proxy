@@ -29,12 +29,13 @@ This document breaks down the runtime flow at a granular level: startup, request
 18. `AuthStore.load()` skips wrong `type` values.
 19. `AuthStore.load()` skips entries without both `access_token` and `refresh_token`.
 20. `AuthStore.load()` computes token expiry from `expired` or JWT `exp`.
-21. `AuthStore.load()` preserves per-auth cooldown and in-flight refresh state across reloads.
-22. `CacheAffinityStore.updateAuths()` receives the current auth list.
-23. `CacheAffinityStore.updateAuths()` rebuilds its `authByPath` lookup map.
-24. `CacheAffinityStore.updateAuths()` prunes stale affinity entries whose auth file disappeared.
-25. `src/server.ts` starts a periodic auth reload every 60 seconds.
-26. `Bun.serve()` starts listening on `CD_PROXY_HOST` / `CD_PROXY_PORT`.
+21. `AuthStore.load()` preserves per-auth cooldown and in-flight refresh state across reloads by auth file path.
+22. `AuthStore.load()` realigns the round-robin cursor from the last chosen auth path so newly inserted files cannot shift the numeric index onto the just-used credential.
+23. `CacheAffinityStore.updateAuths()` receives the current auth list.
+24. `CacheAffinityStore.updateAuths()` rebuilds its `authByPath` lookup map.
+25. `CacheAffinityStore.updateAuths()` prunes stale affinity entries whose auth file disappeared.
+26. `src/server.ts` starts a periodic auth reload every 60 seconds.
+27. `Bun.serve()` starts listening on `CD_PROXY_HOST` / `CD_PROXY_PORT`.
 
 ## 2. Top-level request dispatch flow
 
@@ -102,7 +103,7 @@ Granular flow:
 4. If no affinity credential is available, the proxy asks `AuthStore.choose(tried)`.
 5. `AuthStore.choose()` starts at the current round-robin index.
 6. It skips credentials that are:
-   - already tried in this external request
+   - already tried in this external request (matched by auth file path so reloads cannot retry the same credential object)
    - disabled
    - cooling down
 7. When a credential is picked, the round-robin index advances.

@@ -50,7 +50,7 @@ export async function proxyWebSocketUpgrade(req: Request, server: any, path: str
     } catch (err) {
       lastStatus = 401;
       lastText = String(err);
-      a.coolingUntil = Date.now() + opts.cooldownMs;
+      opts.authStore.cooldown(a, opts.cooldownMs);
       opts.log(`cooling ${a.label} after websocket refresh failure: ${lastText}`);
       continue;
     }
@@ -59,7 +59,7 @@ export async function proxyWebSocketUpgrade(req: Request, server: any, path: str
     if (!connected.ok) {
       lastStatus = connected.status;
       lastText = connected.detail;
-      a.coolingUntil = Date.now() + cooldownMsForFailure(connected.status, opts.cooldownMs);
+      opts.authStore.cooldown(a, cooldownMsForFailure(connected.status, opts.cooldownMs));
       opts.log(`cooling ${a.label} after websocket connect failure: ${connected.detail}`);
       continue;
     }
