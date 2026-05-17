@@ -61,6 +61,7 @@ const State = struct {
     auth_arena: std.heap.ArenaAllocator,
     auths: []AuthEntry = &.{},
     rr: usize = 0,
+    last_chosen_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     stats: Stats = .{},
     http_client: std.http.Client,
@@ -146,7 +147,16 @@ fn authLess(_: void, a: AuthEntry, b: AuthEntry) bool {
     return std.mem.lessThan(u8, a.path, b.path);
 }
 
+fn authIndexByPath(auths: []const AuthEntry, path: []const u8) ?usize {
+    for (auths, 0..) |a, i| {
+        if (std.mem.eql(u8, a.path, path)) return i;
+    }
+    return null;
+}
+
 fn loadAuths(state: *State) !void {
+    const previous_next_path: ?[]const u8 = if (state.auths.len == 0) null else state.auths[state.rr % state.auths.len].path;
+    const previous_last_chosen_path = state.last_chosen_path;
     var next_arena = std.heap.ArenaAllocator.init(state.gpa);
     errdefer next_arena.deinit();
     const aalloc = next_arena.allocator();
@@ -174,10 +184,31 @@ fn loadAuths(state: *State) !void {
     }
     std.mem.sort(AuthEntry, list.items, {}, authLess);
     const owned = try list.toOwnedSlice(aalloc);
+
+    // Auth files are sorted on every reload. If a new file sorts before the
+    // numeric cursor, preserving only the index can repeat the just-used auth.
+    // Realign against stable auth paths before releasing the old arena.
+    var next_rr: usize = 0;
+    var next_last_chosen_path: ?[]const u8 = null;
+    if (owned.len != 0) {
+        next_rr = state.rr % owned.len;
+        if (previous_last_chosen_path) |last_path| {
+            if (authIndexByPath(owned, last_path)) |last_idx| {
+                next_rr = (last_idx + 1) % owned.len;
+                next_last_chosen_path = owned[last_idx].path;
+            } else if (previous_next_path) |next_path| {
+                if (authIndexByPath(owned, next_path)) |next_idx| next_rr = next_idx;
+            }
+        } else if (previous_next_path) |next_path| {
+            if (authIndexByPath(owned, next_path)) |next_idx| next_rr = next_idx;
+        }
+    }
+
     state.auth_arena.deinit();
     state.auth_arena = next_arena;
     state.auths = owned;
-    if (state.rr >= state.auths.len) state.rr = 0;
+    state.rr = next_rr;
+    state.last_chosen_path = next_last_chosen_path;
 }
 
 fn nowMs(io: std.Io) i64 {
@@ -198,6 +229,7 @@ fn chooseAuth(state: *State, tried: []const usize) ?usize {
             if (t == idx) seen = true;
         }
         if (seen) continue;
+        state.last_chosen_path = a.path;
         return idx;
     }
     return null;
